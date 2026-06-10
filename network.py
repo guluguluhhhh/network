@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from grouped_gemm.ops import gmm
 
 
 class RopeEmbedding(nn.Module):
@@ -148,21 +149,28 @@ class FFN(nn.Module):
         topk_weights, topk_indices = torch.topk(router_logits, self.active_experts, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
 
+        # Sort tokens by expert for grouped GEMM
+        flat_indices = topk_indices.reshape(-1)
+        sort_order = flat_indices.argsort(stable=True)
+        sorted_expert_ids = flat_indices[sort_order]
+        sorted_token_ids = sort_order // self.active_experts
+
+        sorted_x = x[sorted_token_ids]
+        sorted_weights = topk_weights.reshape(-1)[sort_order]
+
+        # Count tokens per expert (must be on CPU for grouped_gemm)
+        batch_sizes = torch.bincount(sorted_expert_ids.long(), minlength=self.num_experts).cpu()
+
+        # Grouped GEMM: all experts in one kernel call
+        gate_out = gmm(sorted_x, self.w_gate, batch_sizes)
+        up_out = gmm(sorted_x, self.w_up, batch_sizes)
+        hidden = F.silu(gate_out) * up_out
+        expert_out = gmm(hidden, self.w_down, batch_sizes)
+
+        # Weighted scatter-add back to original positions
         output = torch.zeros_like(x)
-        for expert_id in range(self.num_experts):
-            mask = (topk_indices == expert_id)
-            token_mask = mask.any(dim=-1)
-            if not token_mask.any():
-                continue
-
-            expert_tokens = x[token_mask]
-            gate_out = expert_tokens @ self.w_gate[expert_id]
-            up_out = expert_tokens @ self.w_up[expert_id]
-            hidden = F.silu(gate_out) * up_out
-            expert_out = hidden @ self.w_down[expert_id]
-
-            weights = (mask[token_mask] * topk_weights[token_mask]).sum(dim=-1, keepdim=True)
-            output[token_mask] += expert_out * weights
+        output.scatter_add_(0, sorted_token_ids.unsqueeze(-1).expand_as(expert_out),
+                           expert_out * sorted_weights.unsqueeze(-1))
 
         return output
 
