@@ -13,28 +13,52 @@ from network import Transformer
 
 def profile_execution():
     """Use torch.profiler to trace operator execution times."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     # Warmup
     for i in range(3):
         model(x)
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    import datetime
+    import datetime, json, os
     ts = datetime.datetime.now().strftime("%m%d_%H%M%S")
     tb_log_dir = f"/data0/wjh528431/work/network/tb_log/{ts}"
+
+    NOISE = ("profiler", "frozen importlib", "frozen zipimport", "importlib/",
+             "torch/_inductor", "torch/utils/_config", "is_frozen",
+             "PyCapsule", "bootstrap")
+
+    def filtered_trace_handler(p):
+        default_handler = torch.profiler.tensorboard_trace_handler(tb_log_dir)
+        default_handler(p)
+        for f in os.listdir(tb_log_dir):
+            if not f.endswith(".json"):
+                continue
+            path = os.path.join(tb_log_dir, f)
+            with open(path) as fh:
+                data = json.load(fh)
+            data["traceEvents"] = [
+                ev for ev in data.get("traceEvents", [])
+                if not any(n in ev.get("name", "") for n in NOISE)
+            ]
+            with open(path, "w") as fh:
+                json.dump(data, fh)
+
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=True,
         profile_memory=True,
         with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(tb_log_dir),
+        with_modules=True,
+        schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
+        on_trace_ready=filtered_trace_handler,
     ) as prof:
+        prof.step()
         with record_function("model_forward"):
             y = model(x)
+        prof.step()
     torch.cuda.synchronize()
 
     # Print time-sorted table
@@ -55,7 +79,7 @@ def profile_execution():
 
 def profile_memory_per_operator():
     """Track GPU memory allocation per operator using hooks."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     torch.cuda.reset_peak_memory_stats()
@@ -131,7 +155,7 @@ def profile_memory_per_operator():
 
 def profile_memory_snapshot():
     """Use torch.cuda.memory._record_memory_history for detailed allocation tracking."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     # Warmup
