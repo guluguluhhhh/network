@@ -99,24 +99,20 @@ class Attention(nn.Module):
         q = self.rope(q, seq_len)
         k = self.rope(k, seq_len)
 
-        # Transpose to [heads, seq_len, head_dim] for attention
-        q = q.transpose(0, 1)  # [q_head, seq_len, head_dim]
-        k = k.transpose(0, 1)  # [kv_head, seq_len, head_dim]
-        v = v.transpose(0, 1)  # [kv_head, seq_len, head_dim]
+        # Reshape to [1, heads, seq_len, head_dim] for SDPA
+        q = q.transpose(0, 1).unsqueeze(0)   # [1, q_head, seq_len, head_dim]
+        k = k.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
+        v = v.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
 
-        # GQA: repeat KV heads to match Q heads
+        # GQA: expand KV heads to match Q heads
         n_rep = self.q_head // self.kv_head
         if n_rep > 1:
-            k = k.repeat_interleave(n_rep, dim=0)
-            v = v.repeat_interleave(n_rep, dim=0)
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
 
-        # Scaled dot-product attention (no mask needed for single sequence training)
-        scale = 1.0 / math.sqrt(self.head_dim)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn_weights, v)  # [q_head, seq_len, head_dim]
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
-        out = out.transpose(0, 1).contiguous().view(seq_len, self.embed_dim)
+        out = out.squeeze(0).transpose(0, 1).contiguous().view(seq_len, self.embed_dim)
         return self.o_proj(out)
 
 
