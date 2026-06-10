@@ -23,7 +23,9 @@ def profile_execution():
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    tb_log_dir = "/data0/wjh528431/work/network/tb_log"
+    import datetime
+    ts = datetime.datetime.now().strftime("%m%d_%H%M%S")
+    tb_log_dir = f"/data0/wjh528431/work/network/tb_log/{ts}"
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=True,

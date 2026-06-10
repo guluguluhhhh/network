@@ -136,13 +136,6 @@ class FFN(nn.Module):
         self.w_up = nn.Parameter(torch.empty(num_experts, embed_dim, experts_dim))
         self.w_down = nn.Parameter(torch.empty(num_experts, experts_dim, embed_dim))
 
-        # Initialize expert weights
-        for w in [self.w_gate, self.w_up, self.w_down]:
-            nn.init.xavier_uniform_(w.view(num_experts, -1).T.view(-1, num_experts).T
-                                     .reshape(w.shape).transpose(-2, -1)
-                                     .contiguous().view(-1, w.shape[-1]).T
-                                     .reshape(w.shape))
-        # Simpler init fallback
         nn.init.normal_(self.w_gate, std=0.02)
         nn.init.normal_(self.w_up, std=0.02)
         nn.init.normal_(self.w_down, std=0.02)
@@ -151,31 +144,25 @@ class FFN(nn.Module):
         """x: [seq_len, embed_dim] → [seq_len, embed_dim]"""
         seq_len, embed_dim = x.shape
 
-        # Compute router logits and select top-k experts per token
-        router_logits = self.gate(x)  # [seq_len, num_experts]
+        router_logits = self.gate(x)
         topk_weights, topk_indices = torch.topk(router_logits, self.active_experts, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
 
-        # Flatten tokens across selected experts for batched computation
-        # topk_indices: [seq_len, active_experts]
-        flat_indices = topk_indices.reshape(-1)  # [seq_len * active_experts]
-        flat_x = x.repeat_interleave(self.active_experts, dim=0)  # [seq_len * K, embed_dim]
+        output = torch.zeros_like(x)
+        for expert_id in range(self.num_experts):
+            mask = (topk_indices == expert_id)
+            token_mask = mask.any(dim=-1)
+            if not token_mask.any():
+                continue
 
-        # Batched expert forward using gathered weights
-        # Gather expert params: [seq_len*K, embed_dim, experts_dim]
-        gate_w = self.w_gate[flat_indices]
-        up_w = self.w_up[flat_indices]
-        down_w = self.w_down[flat_indices]
+            expert_tokens = x[token_mask]
+            gate_out = expert_tokens @ self.w_gate[expert_id]
+            up_out = expert_tokens @ self.w_up[expert_id]
+            hidden = F.silu(gate_out) * up_out
+            expert_out = hidden @ self.w_down[expert_id]
 
-        # SwiGLU: SiLU(x @ W_gate) * (x @ W_up) then @ W_down
-        gate_out = torch.bmm(flat_x.unsqueeze(1), gate_w).squeeze(1)  # [N, experts_dim]
-        up_out = torch.bmm(flat_x.unsqueeze(1), up_w).squeeze(1)
-        expert_out = F.silu(gate_out) * up_out
-        expert_out = torch.bmm(expert_out.unsqueeze(1), down_w).squeeze(1)  # [N, embed_dim]
-
-        # Weighted combination back to original token positions
-        expert_out = expert_out.view(seq_len, self.active_experts, embed_dim)
-        output = (expert_out * topk_weights.unsqueeze(-1)).sum(dim=1)
+            weights = (mask[token_mask] * topk_weights[token_mask]).sum(dim=-1, keepdim=True)
+            output[token_mask] += expert_out * weights
 
         return output
 
