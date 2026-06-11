@@ -46,6 +46,35 @@ def profile_execution():
             with open(path, "w") as fh:
                 json.dump(data, fh)
 
+    # --- add record_function markers so TensorBoard timeline shows sections ---
+    active_rfs = []
+
+    def _make_hooks(label):
+        def pre_hook(mod, inp):
+            rf = record_function(label)
+            rf.__enter__()
+            active_rfs.append(rf)
+        def post_hook(mod, inp, out):
+            if active_rfs:
+                active_rfs.pop().__exit__(None, None, None)
+        return pre_hook, post_hook
+
+    hook_handles = []
+    for name, module in model.named_modules():
+        if name == "token_embedding":
+            label = "embedding"
+        elif name.endswith(".attn"):
+            label = f"attention_{name.split('.')[1]}"
+        elif name.endswith(".ffn"):
+            label = f"ffn_{name.split('.')[1]}"
+        elif name == "lm_head":
+            label = "lm_head"
+        else:
+            continue
+        pre, post = _make_hooks(label)
+        hook_handles.append(module.register_forward_pre_hook(pre))
+        hook_handles.append(module.register_forward_hook(post))
+
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=True,
@@ -60,6 +89,10 @@ def profile_execution():
             y = model(x)
         prof.step()
     torch.cuda.synchronize()
+
+    # cleanup hooks
+    for h in hook_handles:
+        h.remove()
 
     # Print time-sorted table
     print("=" * 100)
