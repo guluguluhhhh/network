@@ -13,7 +13,7 @@ from network import Transformer
 
 def profile_execution():
     """Use torch.profiler to trace operator execution times."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     # Warmup
@@ -79,7 +79,7 @@ def profile_execution():
 
 def profile_memory_per_operator():
     """Track GPU memory allocation per operator using hooks."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     torch.cuda.reset_peak_memory_stats()
@@ -155,7 +155,7 @@ def profile_memory_per_operator():
 
 def profile_memory_snapshot():
     """Use torch.cuda.memory._record_memory_history for detailed allocation tracking."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).bfloat16().cuda()
+    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
     # Warmup

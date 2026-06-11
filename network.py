@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from grouped_gemm.ops import gmm
+from scattermoe.parallel_experts import ParallelExperts, flatten_sort_count
 
 
 class RopeEmbedding(nn.Module):
@@ -123,51 +123,38 @@ class FFN(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.active_experts = active_experts
-        self.experts_dim = experts_dim
 
-        # Router gate
         self.gate = nn.Linear(embed_dim, num_experts, bias=False)
-
-        # Each expert is a SwiGLU FFN: gate_proj, up_proj, down_proj
-        self.w_gate = nn.Parameter(torch.empty(num_experts, embed_dim, experts_dim))
-        self.w_up = nn.Parameter(torch.empty(num_experts, embed_dim, experts_dim))
-        self.w_down = nn.Parameter(torch.empty(num_experts, experts_dim, embed_dim))
-
-        nn.init.normal_(self.w_gate, std=0.02)
-        nn.init.normal_(self.w_up, std=0.02)
-        nn.init.normal_(self.w_down, std=0.02)
+        self.gate_proj = ParallelExperts(num_experts, embed_dim, experts_dim)
+        self.up_proj = ParallelExperts(num_experts, embed_dim, experts_dim)
+        self.down_proj = ParallelExperts(num_experts, experts_dim, embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [seq_len, embed_dim] → [seq_len, embed_dim]"""
-        seq_len, embed_dim = x.shape
-
         router_logits = self.gate(x)
         topk_weights, topk_indices = torch.topk(router_logits, self.active_experts, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
 
-        # Sort tokens by expert for grouped GEMM
-        flat_indices = topk_indices.reshape(-1)
-        sort_order = flat_indices.argsort(stable=True)
-        sorted_expert_ids = flat_indices[sort_order]
-        sorted_token_ids = sort_order // self.active_experts
+        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
+            flatten_sort_count(topk_indices, num_experts=self.num_experts)
 
-        sorted_x = x[sorted_token_ids]
-        sorted_weights = topk_weights.reshape(-1)[sort_order]
-
-        # Count tokens per expert (must be on CPU for grouped_gemm)
-        batch_sizes = torch.bincount(sorted_expert_ids.long(), minlength=self.num_experts).cpu()
-
-        # Grouped GEMM: all experts in one kernel call
-        gate_out = gmm(sorted_x, self.w_gate, batch_sizes)
-        up_out = gmm(sorted_x, self.w_up, batch_sizes)
+        gate_out = self.gate_proj(
+            x, self.active_experts,
+            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+            grouped_out=True,
+        )
+        up_out = self.up_proj(
+            x, self.active_experts,
+            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+            grouped_out=True,
+        )
         hidden = F.silu(gate_out) * up_out
-        expert_out = gmm(hidden, self.w_down, batch_sizes)
-
-        # Weighted scatter-add back to original positions
-        output = torch.zeros_like(x)
-        output.scatter_add_(0, sorted_token_ids.unsqueeze(-1).expand_as(expert_out),
-                           expert_out * sorted_weights.unsqueeze(-1))
-
+        output = self.down_proj(
+            hidden, 1,
+            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
+            grouped_in=True,
+            gates=topk_weights,
+        )
         return output
 
 
