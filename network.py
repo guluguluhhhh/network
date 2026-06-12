@@ -2,7 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from scattermoe.parallel_experts import ParallelExperts, flatten_sort_count
+import triton.language as tl
+from kernels.fused_moe_kernel import (
+    invoke_fused_moe_kernel,
+    moe_align_block_size_torch,
+    get_default_config,
+)
 
 
 class RopeEmbedding(nn.Module):
@@ -117,44 +122,103 @@ class Attention(nn.Module):
 
 
 class FFN(nn.Module):
-    """MoE FFN: expert top-k routing + token dispatch + SwiGLU experts + combine."""
+    """MoE FFN using fused_moe_kernel: gate_up fused GEMM + SwiGLU + down fused GEMM."""
 
     def __init__(self, embed_dim: int, num_experts: int, active_experts: int, experts_dim: int):
         super().__init__()
         self.num_experts = num_experts
         self.active_experts = active_experts
+        self.embed_dim = embed_dim
+        self.experts_dim = experts_dim
 
         self.gate = nn.Linear(embed_dim, num_experts, bias=False)
-        self.gate_proj = ParallelExperts(num_experts, embed_dim, experts_dim)
-        self.up_proj = ParallelExperts(num_experts, embed_dim, experts_dim)
-        self.down_proj = ParallelExperts(num_experts, experts_dim, embed_dim)
+        # Fused gate_up weight: [E, 2*experts_dim, embed_dim] (layout: [E, N, K])
+        self.gate_up_weight = nn.Parameter(
+            torch.empty(num_experts, 2 * experts_dim, embed_dim)
+        )
+        # Down weight: [E, embed_dim, experts_dim] (layout: [E, N, K])
+        self.down_weight = nn.Parameter(
+            torch.empty(num_experts, embed_dim, experts_dim)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.gate_up_weight, std=0.02)
+        nn.init.normal_(self.down_weight, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [seq_len, embed_dim] → [seq_len, embed_dim]"""
+        seq_len = x.size(0)
+        top_k = self.active_experts
+
+        # Routing
         router_logits = self.gate(x)
-        topk_weights, topk_indices = torch.topk(router_logits, self.active_experts, dim=-1)
+        topk_weights, topk_indices = torch.topk(router_logits, top_k, dim=-1)
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
 
-        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
-            flatten_sort_count(topk_indices, num_experts=self.num_experts)
+        # Align tokens to block boundaries for fused kernel
+        config_up = get_default_config(
+            M=seq_len, E=self.num_experts, N=2 * self.experts_dim,
+            K=self.embed_dim, top_k=top_k
+        )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = \
+            moe_align_block_size_torch(topk_indices, config_up["BLOCK_SIZE_M"], self.num_experts)
 
-        gate_out = self.gate_proj(
-            x, self.active_experts,
-            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
-            grouped_out=True,
+        # Step 1: Fused gate_up GEMM — [M, K] x [E, 2N, K] → [M*top_k, 2N]
+        gate_up_out = torch.zeros(
+            seq_len * top_k, 2 * self.experts_dim,
+            dtype=x.dtype, device=x.device
         )
-        up_out = self.up_proj(
-            x, self.active_experts,
-            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
-            grouped_out=True,
+        invoke_fused_moe_kernel(
+            A=x,
+            B=self.gate_up_weight,
+            C=gate_up_out,
+            topk_weights=topk_weights.view(-1),
+            topk_ids=topk_indices.view(-1),
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=top_k,
+            config=config_up,
+            compute_type=tl.float16,
         )
-        hidden = F.silu(gate_out) * up_out
-        output = self.down_proj(
-            hidden, 1,
-            sorted_expert_idxs, sorted_scattered_idxs, expert_offsets,
-            grouped_in=True,
-            gates=topk_weights,
+
+        # Step 2: SwiGLU activation
+        gate_out = gate_up_out[:, :self.experts_dim]
+        up_out = gate_up_out[:, self.experts_dim:]
+        hidden = F.silu(gate_out) * up_out  # [M*top_k, experts_dim]
+
+        # Step 3: Down GEMM with router weight — [M*top_k, experts_dim] x [E, embed_dim, experts_dim] → [M*top_k, embed_dim]
+        config_down = get_default_config(
+            M=seq_len, E=self.num_experts, N=self.embed_dim,
+            K=self.experts_dim, top_k=top_k
         )
+        # Re-align for down_proj (may use different BLOCK_SIZE_M)
+        sorted_token_ids_d, expert_ids_d, num_tokens_post_padded_d = \
+            moe_align_block_size_torch(topk_indices, config_down["BLOCK_SIZE_M"], self.num_experts)
+
+        down_out = torch.zeros(
+            seq_len * top_k, self.embed_dim,
+            dtype=x.dtype, device=x.device
+        )
+        invoke_fused_moe_kernel(
+            A=hidden,
+            B=self.down_weight,
+            C=down_out,
+            topk_weights=topk_weights.view(-1),
+            topk_ids=topk_indices.view(-1),
+            sorted_token_ids=sorted_token_ids_d,
+            expert_ids=expert_ids_d,
+            num_tokens_post_padded=num_tokens_post_padded_d,
+            mul_routed_weight=True,  # Fuse weight multiply into GEMM
+            top_k=top_k,
+            config=config_down,
+            compute_type=tl.float16,
+        )
+
+        # Step 4: Reduce across top_k experts per token
+        output = down_out.view(seq_len, top_k, self.embed_dim).sum(dim=1)
         return output
 
 
