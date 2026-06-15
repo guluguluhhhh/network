@@ -8,6 +8,7 @@ from kernels.fused_moe_kernel import (
     moe_align_block_size_torch,
     get_default_config,
 )
+from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
 
 
 class RopeEmbedding(nn.Module):
@@ -64,9 +65,21 @@ class TokenEmbedding(nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """input_ids: [seq_len] → output: [seq_len, embed_dim]"""
         seq_len = input_ids.size(0)
-        positions = torch.arange(seq_len, device=input_ids.device)
-        x = self.token_emb(input_ids) + self.pos_emb(positions)
-        return self.norm(x)
+        embed_dim = self.token_emb.weight.shape[1]
+        output = torch.empty(
+            seq_len, embed_dim,
+            dtype=self.token_emb.weight.dtype,
+            device=input_ids.device,
+        )
+        invoke_fused_embedding_layernorm(
+            input_ids=input_ids,
+            token_emb_weight=self.token_emb.weight,
+            pos_emb_weight=self.pos_emb.weight,
+            ln_weight=self.norm.weight,
+            ln_bias=self.norm.bias,
+            output=output,
+        )
+        return output
 
 
 class Attention(nn.Module):
