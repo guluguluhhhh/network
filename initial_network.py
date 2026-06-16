@@ -220,19 +220,17 @@ class Transformer(nn.Module):
             for _ in range(num_of_layer)
         ])
         self.final_norm = nn.RMSNorm(self.embed_dim)
-        self.lm_head = nn.Linear(self.embed_dim, vocab_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [seq_len] token IDs (single sequence, no batch dim, no KV cache).
-        Returns: [seq_len, vocab_size] logits.
+        Returns: [seq_len, embed_dim] hidden states.
         """
         h = self.token_embedding(x)
         for layer in self.layers:
             h = layer(h)
         h = self.final_norm(h)
-        logits = self.lm_head(h)
-        return logits
+        return h
 
 if __name__ == "__main__":
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()

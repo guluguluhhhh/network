@@ -9,7 +9,8 @@ from kernels.fused_moe_kernel import (
     get_default_config,
 )
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
-from kernels.fused_rope_kernel import invoke_fused_rope
+from kernels.attn_data_prep import invoke_attn_data_prep
+from kernels.flash_attention import invoke_flash_attention
 
 
 class RopeEmbedding(nn.Module):
@@ -102,12 +103,13 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
 
-        # Precompute RoPE cos/sin buffers
+        # Precompute RoPE cos/sin buffers: duplicate freqs → [max_seq_len, rope_dim]
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
         t = torch.arange(max_seq_len).float()
-        freqs = torch.outer(t, inv_freq)  # [max_seq_len, rope_dim // 2]
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+        freqs = torch.outer(t, inv_freq)           # [max_seq_len, rope_dim // 2]
+        emb = torch.cat([freqs, freqs], dim=-1)     # [max_seq_len, rope_dim]
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
         # Split sizes for q, k, v
         self._q_size = head_dim * q_head
@@ -125,26 +127,20 @@ class Attention(nn.Module):
         k = k.view(seq_len, self.kv_head, self.head_dim)
         v = v.view(seq_len, self.kv_head, self.head_dim)
 
-        # QK-Norm before RoPE
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        # ── Kernel 1: Data preparation ──
+        # qkv [seq, qkv_dim] → q/k/v [seq, heads, dim] contiguous with norm+rope
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        q, k, v = invoke_attn_data_prep(
+            qkv, cos, sin,
+            self.q_norm.weight, self.k_norm.weight,
+            self.q_head, self.kv_head, self.head_dim,
+        )
 
-        # Fused RoPE: single Triton kernel for both Q and K (in-place)
-        cos = self.cos_cached[:seq_len].to(q.dtype)
-        sin = self.sin_cached[:seq_len].to(q.dtype)
-        q = q.contiguous()
-        k = k.contiguous()
-        invoke_fused_rope(q, k, cos, sin)
+        # ── Kernel 2: FlashAttention V2 with GQA ──
+        out = invoke_flash_attention(q, k, v)
+        # out is [seq_len, embed_dim] contiguous, ready for o_proj
 
-        # Reshape to [1, heads, seq_len, head_dim] for SDPA
-        q = q.transpose(0, 1).unsqueeze(0)   # [1, q_head, seq_len, head_dim]
-        k = k.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
-        v = v.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
-
-        # GQA: SDPA natively supports different Q/KV head counts (no physical copy)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
-
-        out = out.squeeze(0).transpose(0, 1).contiguous().view(seq_len, self.embed_dim)
         return self.o_proj(out)
 
 
@@ -289,7 +285,6 @@ class Transformer(nn.Module):
             for _ in range(num_of_layer)
         ])
         self.final_norm = nn.RMSNorm(self.embed_dim)
-        self.lm_head = nn.Linear(self.embed_dim, vocab_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -300,8 +295,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h)
         h = self.final_norm(h)
-        logits = self.lm_head(h)
-        return logits
+        return h
 
 if __name__ == "__main__":
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
