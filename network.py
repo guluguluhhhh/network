@@ -141,13 +141,8 @@ class Attention(nn.Module):
         k = k.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
         v = v.transpose(0, 1).unsqueeze(0)   # [1, kv_head, seq_len, head_dim]
 
-        # GQA: expand KV heads to match Q heads
-        n_rep = self.q_head // self.kv_head
-        if n_rep > 1:
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        # GQA: SDPA natively supports different Q/KV head counts (no physical copy)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=True)
 
         out = out.squeeze(0).transpose(0, 1).contiguous().view(seq_len, self.embed_dim)
         return self.o_proj(out)
