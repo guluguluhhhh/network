@@ -92,22 +92,30 @@ class Attention(nn.Module):
         self.kv_head = kv_head
         self.embed_dim = head_dim * q_head
 
-        self.q_proj = nn.Linear(self.embed_dim, head_dim * q_head, bias=False)
-        self.k_proj = nn.Linear(self.embed_dim, head_dim * kv_head, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, head_dim * kv_head, bias=False)
+        # Fused QKV projection: single GEMM instead of 3 separate
+        self.qkv_dim = head_dim * (q_head + 2 * kv_head)
+        self.qkv_proj = nn.Linear(self.embed_dim, self.qkv_dim, bias=False)
         self.o_proj = nn.Linear(head_dim * q_head, self.embed_dim, bias=False)
 
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
         self.rope = RopeEmbedding(head_dim, max_seq_len=max_seq_len)
 
+        # Split sizes for q, k, v
+        self._q_size = head_dim * q_head
+        self._kv_size = head_dim * kv_head
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [seq_len, embed_dim] → [seq_len, embed_dim]"""
         seq_len = x.size(0)
 
-        q = self.q_proj(x).view(seq_len, self.q_head, self.head_dim)
-        k = self.k_proj(x).view(seq_len, self.kv_head, self.head_dim)
-        v = self.v_proj(x).view(seq_len, self.kv_head, self.head_dim)
+        # Single fused GEMM for Q, K, V
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self._q_size, self._kv_size, self._kv_size], dim=-1)
+
+        q = q.view(seq_len, self.q_head, self.head_dim)
+        k = k.view(seq_len, self.kv_head, self.head_dim)
+        v = v.view(seq_len, self.kv_head, self.head_dim)
 
         # QK-Norm before RoPE
         q = self.q_norm(q)
