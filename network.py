@@ -5,7 +5,7 @@ import math
 import triton.language as tl
 from kernels.fused_moe_kernel import (
     invoke_fused_moe_kernel,
-    moe_align_block_size_torch,
+    moe_align_block_size_triton,
     get_default_config,
 )
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
@@ -189,7 +189,7 @@ class FFN(nn.Module):
             K=self.embed_dim, top_k=top_k
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = \
-            moe_align_block_size_torch(topk_indices, config_up["BLOCK_SIZE_M"], self.num_experts)
+            moe_align_block_size_triton(topk_indices, config_up["BLOCK_SIZE_M"], self.num_experts)
 
         # Step 1: Fused gate_up GEMM — [M, K] x [E, 2N, K] → [M*top_k, 2N]
         gate_up_out = torch.zeros(
@@ -223,7 +223,7 @@ class FFN(nn.Module):
         )
         # Re-align for down_proj (may use different BLOCK_SIZE_M)
         sorted_token_ids_d, expert_ids_d, num_tokens_post_padded_d = \
-            moe_align_block_size_torch(topk_indices, config_down["BLOCK_SIZE_M"], self.num_experts)
+            moe_align_block_size_triton(topk_indices, config_down["BLOCK_SIZE_M"], self.num_experts)
 
         down_out = torch.zeros(
             seq_len * top_k, self.embed_dim,
