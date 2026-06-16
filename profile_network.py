@@ -16,8 +16,9 @@ def profile_execution():
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
 
-    # Warmup
-    for i in range(3):
+    # Warmup — enough iterations to ensure ALL Triton kernels are JIT-compiled
+    # and cached, so profiled run only measures actual dispatch + GPU execution.
+    for i in range(10):
         model(x)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
@@ -78,16 +79,23 @@ def profile_execution():
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         record_shapes=True,
-        profile_memory=True,
+        profile_memory=False,
         with_stack=True,
         with_modules=True,
-        schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=1),
+        schedule=torch.profiler.schedule(
+            skip_first=2,   # 前2步完全跳过（Triton JIT 在 profiler context 下重编译）
+            wait=0,
+            warmup=1,       # 第3步 warmup（丢弃，但确保 cache 热）
+            active=1,       # 第4步正式记录
+            repeat=1,
+        ),
         on_trace_ready=filtered_trace_handler,
     ) as prof:
-        prof.step()
-        with record_function("model_forward"):
-            y = model(x)
-        prof.step()
+        for _ in range(5):
+            with record_function("model_forward"):
+                y = model(x)
+            torch.cuda.synchronize()  # drain GPU queue so next step starts clean
+            prof.step()
     torch.cuda.synchronize()
 
     # cleanup hooks

@@ -9,6 +9,7 @@ from kernels.fused_moe_kernel import (
     get_default_config,
 )
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
+from kernels.fused_rope_kernel import invoke_fused_rope
 
 
 class RopeEmbedding(nn.Module):
@@ -91,6 +92,7 @@ class Attention(nn.Module):
         self.q_head = q_head
         self.kv_head = kv_head
         self.embed_dim = head_dim * q_head
+        self.rope_dim = 32  # partial RoPE on last 32 dims
 
         # Fused QKV projection: single GEMM instead of 3 separate
         self.qkv_dim = head_dim * (q_head + 2 * kv_head)
@@ -99,7 +101,13 @@ class Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(head_dim)
         self.k_norm = nn.RMSNorm(head_dim)
-        self.rope = RopeEmbedding(head_dim, max_seq_len=max_seq_len)
+
+        # Precompute RoPE cos/sin buffers
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.rope_dim, 2).float() / self.rope_dim))
+        t = torch.arange(max_seq_len).float()
+        freqs = torch.outer(t, inv_freq)  # [max_seq_len, rope_dim // 2]
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
         # Split sizes for q, k, v
         self._q_size = head_dim * q_head
@@ -121,9 +129,12 @@ class Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Apply partial RoPE
-        q = self.rope(q, seq_len)
-        k = self.rope(k, seq_len)
+        # Fused RoPE: single Triton kernel for both Q and K (in-place)
+        cos = self.cos_cached[:seq_len].to(q.dtype)
+        sin = self.sin_cached[:seq_len].to(q.dtype)
+        q = q.contiguous()
+        k = k.contiguous()
+        invoke_fused_rope(q, k, cos, sin)
 
         # Reshape to [1, heads, seq_len, head_dim] for SDPA
         q = q.transpose(0, 1).unsqueeze(0)   # [1, q_head, seq_len, head_dim]
