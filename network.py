@@ -13,6 +13,7 @@ from kernels.fused_moe_kernel import (
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
 from kernels.attn_data_prep import invoke_attn_data_prep
 from kernels.flash_attention import invoke_flash_attention
+from kernels.skip_rmsnorm import invoke_skip_rmsnorm
 
 
 class RopeEmbedding(nn.Module):
@@ -248,8 +249,17 @@ class TransformerBlock(nn.Module):
         self.ffn = FFN(embed_dim, num_experts, active_experts, experts_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.ffn(self.ffn_norm(x))
+        # attn_norm + attention (unchanged)
+        attn_out = self.attn(self.attn_norm(x))
+
+        # skip_rmsnorm: fused x+=attn_out + ffn_norm → 1 kernel (was 2)
+        ffn_in = invoke_skip_rmsnorm(x, attn_out, self.ffn_norm.weight)
+
+        # FFN (unchanged)
+        ffn_out = self.ffn(ffn_in)
+
+        # residual add (1 elementwise kernel, unavoidable without coupling to next layer)
+        x.add_(ffn_out)
         return x
 
 
