@@ -128,8 +128,8 @@ def invoke_flash_attention(
 
     o = torch.empty(seq_len, q_head, head_dim, dtype=q.dtype, device=q.device)
 
-    BLOCK_M = 32
-    BLOCK_N = 32
+    BLOCK_M = 64
+    BLOCK_N = 64
 
     assert head_dim <= 128 and head_dim % 16 == 0, "head_dim for dot compatibility"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
