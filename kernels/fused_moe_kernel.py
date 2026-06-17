@@ -178,6 +178,155 @@ def invoke_fused_moe_kernel(
     )
 
 
+# ─── SwiGLU-fused down MoE kernel ───────────────────────────────────────────
+# Eliminates the intermediate "hidden" tensor (silu*gate*up) by fusing:
+#   gate_up_out → split → SwiGLU → down GEMM  (all in one launch).
+# Saves: ~35 MB allocation + 3 elementwise silu/mul kernels + Python dispatch gap.
+
+
+@triton.jit
+def fused_moe_swiglu_down_kernel(
+    gate_up_ptr,                # [num_tokens, 2*experts_dim]
+    down_b_ptr,                 # [E, embed_dim, experts_dim]
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N,                          # = embed_dim (output cols)
+    K,                          # = experts_dim (inner dim)
+    EM,
+    num_valid_tokens,
+    stride_gateup_m, stride_gateup_n,
+    stride_be, stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+):
+    """
+    Fused SwiGLU + down GEMM.
+    Reads gate_up_out[token, :] → split gate/up → silu(gate)*up → down GEMM → output.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    # Token indexing
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+
+    # Output column range
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    # ── Phase: SwiGLU + down GEMM ──
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        kmask = (offs_k < K - k_start) if not even_Ks else None
+
+        # Load gate and up from gate_up_out for this K slice
+        gate_row_idx = offs_token[:, None]  # [BLOCK_M, 1]
+        gate_ptr = gate_up_ptr + gate_row_idx * stride_gateup_m + (k_start + offs_k)[None, :] * stride_gateup_n
+        up_ptr   = gate_up_ptr + gate_row_idx * stride_gateup_m + (K + k_start + offs_k)[None, :] * stride_gateup_n
+
+        raw_gate = tl.load(gate_ptr, mask=token_mask[:, None] & (kmask[None, :] if kmask is not None else True), other=0.0).to(tl.float32)
+        raw_up   = tl.load(up_ptr,   mask=token_mask[:, None] & (kmask[None, :] if kmask is not None else True), other=0.0).to(tl.float32)
+
+        # SwiGLU: silu(gate) * up = gate * sigmoid(gate) * up
+        activated = tl.sigmoid(raw_gate) * raw_gate * raw_up  # [BLOCK_M, BLOCK_K]
+
+        # Down weight for this expert: [embed_dim, experts_dim]
+        # Load tile [embed_dim, BLOCK_K] for current K slice
+        down_b_tile_ptr = (
+            down_b_ptr + off_experts * stride_be
+            + (k_start + offs_k[:, None]) * stride_bk + offs_cn[None, :] * stride_bn
+        )
+        if even_Ks:
+            b = tl.load(down_b_tile_ptr)
+        else:
+            b = tl.load(down_b_tile_ptr, mask=(offs_k[:, None] < K - k_start), other=0.0)
+
+        accumulator += tl.dot(activated.to(compute_type), b)
+
+    # Apply router weight
+    moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+    accumulator *= moe_weight[:, None]
+    accumulator = accumulator.to(compute_type)
+
+    # Write output
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def invoke_fused_moe_swiglu_down(
+    gate_up_out: torch.Tensor,  # [M * top_k, 2 * experts_dim]
+    down_weight: torch.Tensor,  # [E, embed_dim, experts_dim]
+    out: torch.Tensor,          # [M * top_k, embed_dim]
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+) -> None:
+    experts_dim = down_weight.shape[2]
+    embed_dim = down_weight.shape[1]
+    even_Ks = experts_dim % config["BLOCK_SIZE_K"] == 0
+
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(embed_dim, META["BLOCK_SIZE_N"]),
+    )
+
+    fused_moe_swiglu_down_kernel[grid](
+        gate_up_out,
+        down_weight,
+        out,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        embed_dim,
+        experts_dim,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        gate_up_out.stride(0),
+        gate_up_out.stride(1),
+        down_weight.stride(0),
+        down_weight.stride(2),
+        down_weight.stride(1),
+        out.stride(-2),
+        out.stride(-1),
+        top_k=top_k,
+        compute_type=compute_type,
+        even_Ks=even_Ks,
+        **config,
+    )
+
+
 def moe_align_block_size_torch(
     topk_ids: torch.Tensor,  # [M, top_k]
     block_size: int,
@@ -441,3 +590,69 @@ def get_default_config(
             "num_warps": 4,
             "num_stages": 3,
         }
+
+
+# ─── Fused topk + softmax kernel ─────────────────────────────────────────────
+# Replaces: topk → softmax(fp32) → .to(fp16) → .copy_  (~4 elementwise kernels)
+# with a single Triton launch.  Per-token: load 64 logits, repeated-argmax top-8,
+# softmax on the 8 selected values, output fp16 weights + int64 indices.
+
+@triton.jit
+def _fused_topk_softmax_kernel(
+    logits_ptr,             # [seq_len, num_experts] fp16
+    weights_ptr,            # [seq_len, top_k] fp16 output
+    indices_ptr,            # [seq_len, top_k] int64 output
+    seq_len,
+    num_experts: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_E: tl.constexpr,  # num_experts (must be power-of-2 for full load)
+):
+    """Grid: (seq_len,).  One program per token row."""
+    row = tl.program_id(0)
+    if row >= seq_len:
+        return
+
+    offs = tl.arange(0, BLOCK_E)
+    mask_e = offs < num_experts
+    x = tl.load(logits_ptr + row * num_experts + offs, mask=mask_e, other=float('-inf')).to(tl.float32)
+
+    top_vals = tl.zeros([top_k], dtype=tl.float32)
+    top_idxs = tl.zeros([top_k], dtype=tl.int32)
+
+    # Repeated argmax: find top-k values
+    for k in range(top_k):
+        idx = tl.argmax(x, axis=0)
+        val = tl.max(x, axis=0)
+        top_idxs = tl.where(tl.arange(0, top_k) == k, idx, top_idxs)
+        top_vals = tl.where(tl.arange(0, top_k) == k, val, top_vals)
+        x = tl.where(offs == idx, float('-inf'), x)
+
+    # Softmax in fp32
+    m = tl.max(top_vals, axis=0)
+    w = tl.exp(top_vals - m)
+    w = w / tl.sum(w, axis=0)
+
+    out_offs = tl.arange(0, top_k)
+    tl.store(weights_ptr + row * top_k + out_offs, w.to(tl.float16))
+    tl.store(indices_ptr + row * top_k + out_offs, top_idxs)
+
+
+def invoke_fused_topk_softmax(
+    logits: torch.Tensor,       # [seq_len, num_experts] fp16
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (weights [seq_len, top_k] fp16, indices [seq_len, top_k] int64)."""
+    seq_len, num_experts = logits.shape
+    weights = torch.empty(seq_len, top_k, dtype=logits.dtype, device=logits.device)
+    indices = torch.empty(seq_len, top_k, dtype=torch.int32, device=logits.device)
+
+    BLOCK_E = triton.next_power_of_2(num_experts)
+    grid = (seq_len,)
+    _fused_topk_softmax_kernel[grid](
+        logits, weights, indices,
+        seq_len,
+        num_experts=num_experts,
+        top_k=top_k,
+        BLOCK_E=BLOCK_E,
+    )
+    return weights, indices

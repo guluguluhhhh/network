@@ -7,6 +7,8 @@ from kernels.fused_moe_kernel import (
     invoke_fused_moe_kernel,
     moe_align_block_size_triton,
     get_default_config,
+    invoke_fused_moe_swiglu_down,
+    invoke_fused_topk_softmax,
 )
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
 from kernels.attn_data_prep import invoke_attn_data_prep
@@ -173,22 +175,21 @@ class FFN(nn.Module):
         """x: [seq_len, embed_dim] → [seq_len, embed_dim]"""
         seq_len = x.size(0)
         top_k = self.active_experts
-
-        # Routing
-        router_logits = self.gate(x)
-        topk_weights, topk_indices = torch.topk(router_logits, top_k, dim=-1)
-        topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32).to(x.dtype)
-
-        # Align tokens to block boundaries for fused kernel
         config_up = get_default_config(
             M=seq_len, E=self.num_experts, N=2 * self.experts_dim,
             K=self.embed_dim, top_k=top_k
         )
+
+        # Routing: top-k + softmax fused in single Triton kernel
+        router_logits = self.gate(x)
+        topk_weights, topk_indices = invoke_fused_topk_softmax(router_logits, top_k)
+
+        # Align tokens to block boundaries for fused kernel
         sorted_token_ids, expert_ids, num_tokens_post_padded = \
             moe_align_block_size_triton(topk_indices, config_up["BLOCK_SIZE_M"], self.num_experts)
 
         # Step 1: Fused gate_up GEMM — [M, K] x [E, 2N, K] → [M*top_k, 2N]
-        gate_up_out = torch.zeros(
+        gate_up_out = torch.empty(
             seq_len * top_k, 2 * self.experts_dim,
             dtype=x.dtype, device=x.device
         )
@@ -207,34 +208,24 @@ class FFN(nn.Module):
             compute_type=tl.float16,
         )
 
-        # Step 2: SwiGLU activation
-        gate_out = gate_up_out[:, :self.experts_dim]
-        up_out = gate_up_out[:, self.experts_dim:]
-        hidden = F.silu(gate_out) * up_out  # [M*top_k, experts_dim]
-
-        # Step 3: Down GEMM with router weight — [M*top_k, experts_dim] x [E, embed_dim, experts_dim] → [M*top_k, embed_dim]
+        # Step 2+3: SwiGLU + Down GEMM fused — [M*top_k, 2N] → [M*top_k, embed_dim]
         config_down = get_default_config(
             M=seq_len, E=self.num_experts, N=self.embed_dim,
             K=self.experts_dim, top_k=top_k
         )
-        # Re-align for down_proj (may use different BLOCK_SIZE_M)
-        sorted_token_ids_d, expert_ids_d, num_tokens_post_padded_d = \
-            moe_align_block_size_triton(topk_indices, config_down["BLOCK_SIZE_M"], self.num_experts)
-
-        down_out = torch.zeros(
+        down_out = torch.empty(
             seq_len * top_k, self.embed_dim,
             dtype=x.dtype, device=x.device
         )
-        invoke_fused_moe_kernel(
-            A=hidden,
-            B=self.down_weight,
-            C=down_out,
+        invoke_fused_moe_swiglu_down(
+            gate_up_out=gate_up_out,
+            down_weight=self.down_weight,
+            out=down_out,
             topk_weights=topk_weights.view(-1),
             topk_ids=topk_indices.view(-1),
-            sorted_token_ids=sorted_token_ids_d,
-            expert_ids=expert_ids_d,
-            num_tokens_post_padded=num_tokens_post_padded_d,
-            mul_routed_weight=True,  # Fuse weight multiply into GEMM
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
             top_k=top_k,
             config=config_down,
             compute_type=tl.float16,
