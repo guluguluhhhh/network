@@ -20,11 +20,11 @@ import triton.language as tl
 @triton.jit
 def _flash_attn_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
-    seq_len,
-    stride_q_seq, stride_q_head,   # seq-first: [S, Hq, D]
-    stride_k_seq, stride_k_head,   # [S, Hk, D]
-    stride_v_seq, stride_v_head,   # [S, Hk, D]
-    stride_o_seq, stride_o_head,   # [S, Hq, D]
+    q_seq_len, kv_seq_len,
+    stride_q_seq, stride_q_head,   # seq-first: [S_q, Hq, D]
+    stride_k_seq, stride_k_head,   # [S_kv, Hk, D]
+    stride_v_seq, stride_v_head,   # [S_kv, Hk, D]
+    stride_o_seq, stride_o_head,   # [S_q, Hq, D]
     softmax_scale: tl.constexpr,    # 1/sqrt(head_dim)
     COMPUTE_DTYPE: tl.constexpr,
     Q_HEAD: tl.constexpr,
@@ -32,13 +32,17 @@ def _flash_attn_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     """
-    Grid: (triton.cdiv(seq_len, BLOCK_M), Q_HEAD).
+    Grid: (triton.cdiv(q_seq_len, BLOCK_M), Q_HEAD).
 
     Each program processes BLOCK_M query rows from one Q head against
     all KV blocks (BLOCK_N rows each), using the appropriate KV head
     via GQA (q_head -> kv_head = q_head // (Q_HEAD // KV_HEAD)).
+
+    Supports q_seq_len != kv_seq_len for decode with KV cache.
+    IS_CAUSAL: apply causal mask during prefill (q_pos = kv_seq_len - q_seq_len + local_q_idx).
     """
     pid_m = tl.program_id(0)        # which Q-tile along seq dim
     q_head_idx = tl.program_id(1)   # which Q head
@@ -48,7 +52,11 @@ def _flash_attn_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M] Q row indices
     offs_n = tl.arange(0, BLOCK_N)                      # [BLOCK_N] KV row indices
     offs_d = tl.arange(0, HEAD_DIM)                     # [HEAD_DIM] feature dim
-    qm_mask = offs_m < seq_len
+    qm_mask = offs_m < q_seq_len
+
+    # For causal mask: map Q local index to global position
+    # global_q_pos = kv_seq_len - q_seq_len + local_q_idx
+    q_offset = kv_seq_len - q_seq_len
 
     # ── Load Q tile [BLOCK_M, HEAD_DIM] ──
     q_base = q_ptr + q_head_idx * stride_q_head
@@ -67,9 +75,9 @@ def _flash_attn_kernel(
     v_base = v_ptr + kv_head_idx * stride_v_head
 
     # ── Loop over KV blocks ──
-    n_blocks = tl.cdiv(seq_len, BLOCK_N)
+    n_blocks = tl.cdiv(kv_seq_len, BLOCK_N)
     for n_start in range(0, n_blocks * BLOCK_N, BLOCK_N):
-        kn_mask = offs_n < (seq_len - n_start)
+        kn_mask = offs_n < (kv_seq_len - n_start)
 
         # Load K [BLOCK_N, HEAD_DIM]
         k = tl.load(
@@ -79,6 +87,11 @@ def _flash_attn_kernel(
         # Compute S = Q @ K^T  [BLOCK_M, BLOCK_N]
         s = tl.dot(q, tl.trans(k)) * softmax_scale
         s = tl.where(kn_mask[None, :], s, float("-inf"))
+
+        # Causal mask: Q position (q_offset + offs_m) must >= KV position (n_start + offs_n)
+        if IS_CAUSAL:
+            causal_mask = (q_offset + offs_m)[:, None] >= (n_start + offs_n)[None, :]
+            s = tl.where(causal_mask, s, float("-inf"))
 
         # Online softmax update
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -109,24 +122,33 @@ def _flash_attn_kernel(
 
 
 def invoke_flash_attention(
-    q: torch.Tensor,   # [seq, q_head, dim]  seq-first contiguous
-    k: torch.Tensor,   # [seq, kv_head, dim]
-    v: torch.Tensor,   # [seq, kv_head, dim]
+    q: torch.Tensor,   # [q_seq, q_head, dim]  seq-first contiguous
+    k: torch.Tensor,   # [kv_seq, kv_head, dim]
+    v: torch.Tensor,   # [kv_seq, kv_head, dim]
     softmax_scale: float | None = None,
+    is_causal: bool = False,
 ) -> torch.Tensor:
     """
     FlashAttention V2 with GQA, seq-first layout.
 
-    Returns out: [seq, q_head * dim] contiguous, seq-first, ready for o_proj.
+    Supports q_seq != kv_seq for decode with KV cache:
+      - prefill: q_seq == kv_seq (both = prompt_len)
+      - decode:  q_seq == 1, kv_seq == cached_len
+
+    Args:
+        is_causal: Apply causal mask. Q positions are aligned to the END of KV
+                   (i.e. q_pos[i] = kv_seq - q_seq + i).
+
+    Returns out: [q_seq, q_head * dim] contiguous, seq-first, ready for o_proj.
     """
-    seq_len, q_head, head_dim = q.shape
-    _, kv_head, _ = k.shape
+    q_seq_len, q_head, head_dim = q.shape
+    kv_seq_len, kv_head, _ = k.shape
     assert head_dim == v.shape[2] and kv_head == k.shape[1]
 
     scale = softmax_scale if softmax_scale is not None else (head_dim ** -0.5)
     compute_dtype = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
-    o = torch.empty(seq_len, q_head, head_dim, dtype=q.dtype, device=q.device)
+    o = torch.empty(q_seq_len, q_head, head_dim, dtype=q.dtype, device=q.device)
 
     BLOCK_M = 64
     BLOCK_N = 64
@@ -134,11 +156,11 @@ def invoke_flash_attention(
     assert head_dim <= 128 and head_dim % 16 == 0, "head_dim for dot compatibility"
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
 
-    grid = (triton.cdiv(seq_len, BLOCK_M), q_head)
+    grid = (triton.cdiv(q_seq_len, BLOCK_M), q_head)
 
     _flash_attn_kernel[grid](
         q, k, v, o,
-        seq_len,
+        q_seq_len, kv_seq_len,
         stride_q_seq=q.stride(0), stride_q_head=q.stride(1),
         stride_k_seq=k.stride(0), stride_k_head=k.stride(1),
         stride_v_seq=v.stride(0), stride_v_head=v.stride(1),
@@ -150,7 +172,8 @@ def invoke_flash_attention(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_CAUSAL=is_causal,
     )
 
-    # Flatten: [seq, q_head, dim] → [seq, q_head * dim] = [seq, embed_dim]
-    return o.reshape(seq_len, q_head * head_dim)
+    # Flatten: [q_seq, q_head, dim] → [q_seq, q_head * dim] = [q_seq, embed_dim]
+    return o.reshape(q_seq_len, q_head * head_dim)

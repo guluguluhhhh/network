@@ -7,7 +7,12 @@ Profiling script for network.py Transformer model.
 
 import torch
 import torch.nn as nn
+import sys
+import os
 from torch.profiler import profile, ProfilerActivity, record_function
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from network import Transformer
 
 
