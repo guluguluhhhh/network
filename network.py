@@ -85,6 +85,7 @@ class Attention(nn.Module):
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        num_decode_seqs: int = 0,
     ) -> torch.Tensor:
         """x: [num_tokens, embed_dim] → [num_tokens, embed_dim]
 
@@ -93,6 +94,7 @@ class Attention(nn.Module):
             layer_idx: index of this layer in the model (for kv_cache addressing).
             kv_cache: if provided, uses KV cache for incremental decoding.
             seq_lens: [num_seqs] tokens per sequence in this forward call.
+            num_decode_seqs: split index (decode seqs first, prefill seqs after).
         """
         num_tokens = x.size(0)
         num_seqs = seq_lens.size(0) if seq_lens is not None else 1
@@ -129,7 +131,8 @@ class Attention(nn.Module):
             torch.cumsum(seq_lens.to(torch.int32), dim=0, out=cu_seqlens_q[1:])
             ctx_lens = kv_cache.context_lens[:num_seqs] + seq_lens.to(torch.int32)
 
-            out = invoke_flash_attention(q, k_cache, v_cache, cu_seqlens_q, ctx_lens)
+            out = invoke_flash_attention(q, k_cache, v_cache, cu_seqlens_q, ctx_lens,
+                                        num_decode_seqs=num_decode_seqs)
 
         return self.o_proj(out)
 
@@ -242,9 +245,10 @@ class TransformerBlock(nn.Module):
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        num_decode_seqs: int = 0,
     ) -> torch.Tensor:
         # attn_norm + attention
-        attn_out = self.attn(self.attn_norm(x), positions, layer_idx=layer_idx, kv_cache=kv_cache, seq_lens=seq_lens)
+        attn_out = self.attn(self.attn_norm(x), positions, layer_idx=layer_idx, kv_cache=kv_cache, seq_lens=seq_lens, num_decode_seqs=num_decode_seqs)
 
         # skip_rmsnorm: fused x+=attn_out + ffn_norm → 1 kernel (was 2)
         ffn_in = invoke_skip_rmsnorm(x, attn_out, self.ffn_norm.weight)
@@ -293,16 +297,18 @@ class Transformer(nn.Module):
         positions: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        num_decode_seqs: int = 0,
     ) -> torch.Tensor:
         """
         Token-flat forward (vLLM V1 style).
         input_ids: [num_tokens], positions: [num_tokens],
         kv_cache: multi-seq cache, seq_lens: [num_seqs].
+        num_decode_seqs: split index (decode first, prefill after).
         Returns: [num_tokens, vocab_size] logits.
         """
         h = self.token_embedding(input_ids, positions)
         for i, layer in enumerate(self.layers):
-            h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, seq_lens=seq_lens)
+            h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, seq_lens=seq_lens, num_decode_seqs=num_decode_seqs)
         h = self.final_norm(h)
         logits = self.lm_head(h)
 
@@ -376,7 +382,7 @@ class Transformer(nn.Module):
             # Run single token through model with KV cache
             pos = kv_cache.context_lens[0:1].long()
             sl = torch.ones(1, device=device, dtype=torch.int32)
-            logits = self.forward(next_token.unsqueeze(0), pos, kv_cache, sl)
+            logits = self.forward(next_token.unsqueeze(0), pos, kv_cache, sl, num_decode_seqs=1)
             next_token_logits = logits[0]  # [vocab]
 
         return torch.cat(generated_ids, dim=0)
@@ -438,5 +444,5 @@ if __name__ == "__main__":
     tokens = torch.randint(0, 1000, [4]).cuda()
     positions = batch_kv.context_lens.long()
     seq_lens = torch.ones(4, dtype=torch.int32).cuda()
-    logits = model.forward(tokens, positions, batch_kv, seq_lens)
+    logits = model.forward(tokens, positions, batch_kv, seq_lens, num_decode_seqs=4)
     print(f"Batched decode: 4 seqs, logits={logits.shape}")

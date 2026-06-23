@@ -19,12 +19,18 @@ from network import Transformer
 def profile_execution():
     """Use torch.profiler to trace operator execution times."""
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
-    x = torch.randint(low=0, high=220000, size=[4455]).cuda()
+    seq_len = 4096
+    x = torch.randint(0, 1000, [seq_len]).cuda()
+    positions = torch.arange(seq_len).cuda()
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32).cuda()
 
-    # Warmup — enough iterations to ensure ALL Triton kernels are JIT-compiled
-    # and cached, so profiled run only measures actual dispatch + GPU execution.
+    def run_forward():
+        kv = model.create_kv_cache(num_seqs=1)
+        return model.forward(x, positions, kv, seq_lens)
+
+    # Warmup
     for i in range(10):
-        model(x)
+        run_forward()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
@@ -98,7 +104,7 @@ def profile_execution():
     ) as prof:
         for _ in range(5):
             with record_function("model_forward"):
-                y = model(x)
+                y = run_forward()
             torch.cuda.synchronize()  # drain GPU queue so next step starts clean
             prof.step()
     torch.cuda.synchronize()
@@ -125,8 +131,11 @@ def profile_execution():
 
 def profile_memory_per_operator():
     """Track GPU memory allocation per operator using hooks."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
-    x = torch.randint(low=0, high=220000, size=[4455]).cuda()
+    model = Transformer(num_of_layer=1).half().cuda()
+    seq_len = 64
+    x = torch.randint(0, 1000, [seq_len]).cuda()
+    positions = torch.arange(seq_len).cuda()
+    seq_lens_t = torch.tensor([seq_len], dtype=torch.int32).cuda()
 
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
@@ -168,7 +177,7 @@ def profile_memory_per_operator():
     print(f"Base memory (model weights + input): {base_mem:.2f} MB")
     print(f"{'=' * 100}")
 
-    _ = model(x)
+    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
     torch.cuda.synchronize()
 
     peak_mem = torch.cuda.max_memory_allocated() / 1024**2
@@ -201,11 +210,14 @@ def profile_memory_per_operator():
 
 def profile_memory_snapshot():
     """Use torch.cuda.memory._record_memory_history for detailed allocation tracking."""
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
-    x = torch.randint(low=0, high=220000, size=[4455]).cuda()
+    model = Transformer(num_of_layer=1).half().cuda()
+    seq_len = 64
+    x = torch.randint(0, 1000, [seq_len]).cuda()
+    positions = torch.arange(seq_len).cuda()
+    seq_lens_t = torch.tensor([seq_len], dtype=torch.int32).cuda()
 
     # Warmup
-    _ = model(x)
+    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -213,7 +225,7 @@ def profile_memory_snapshot():
     # Record memory history
     torch.cuda.memory._record_memory_history(max_entries=100000)
 
-    _ = model(x)
+    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
     torch.cuda.synchronize()
 
     # Export snapshot
