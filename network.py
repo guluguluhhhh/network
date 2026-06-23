@@ -100,51 +100,36 @@ class Attention(nn.Module):
         # Single fused GEMM for Q, K, V
         qkv = self.qkv_proj(x)
 
-        # ── Kernel 1: Data preparation with position-aware RoPE ──
+        # RoPE cos/sin indexed by positions
         cos = self.cos_cached[positions.long()]
         sin = self.sin_cached[positions.long()]
-        q, k, v = invoke_attn_data_prep(
-            qkv, cos, sin,
-            self.q_norm.weight, self.k_norm.weight,
-            self.q_head, self.kv_head, self.head_dim,
-        )
 
-        # ── KV Cache handling ──
         if kv_cache is not None:
-            # Write K/V to cache per sequence
-            token_offset = 0
-            for i in range(num_seqs):
-                slen = seq_lens[i].item()
-                kv_cache.update(layer_idx, i, k[token_offset:token_offset+slen], v[token_offset:token_offset+slen])
-                token_offset += slen
-
-            # ── Kernel 2: Varlen FlashAttention (one launch for all seqs) ──
-            # Build cu_seqlens_q from seq_lens
+            # Compute per-token byte offsets for direct cache write
             device = x.device
+            k_cache = kv_cache.cache[:num_seqs, layer_idx, 0]  # [num_seqs, max_len, kv_head, dim]
+            v_cache = kv_cache.cache[:num_seqs, layer_idx, 1]
+
+            # Per-token write offsets into cache (vectorized)
+            seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), seq_lens.long())
+            local_offsets = torch.cat([torch.arange(s, device=device) for s in seq_lens.tolist()])
+            write_positions = kv_cache.context_lens[seq_ids] + local_offsets
+            kv_write_offsets = (seq_ids * k_cache.stride(0) + write_positions * k_cache.stride(1)).to(torch.int64)
+
+            # attn_data_prep: Q to fresh tensor, K/V directly to cache
+            q = invoke_attn_data_prep(
+                qkv, cos, sin,
+                self.q_norm.weight, self.k_norm.weight,
+                self.q_head, self.kv_head, self.head_dim,
+                k_cache, v_cache, kv_write_offsets,
+            )
+
+            # Attention: read KV directly from cache (zero-copy)
             cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
             torch.cumsum(seq_lens.to(torch.int32), dim=0, out=cu_seqlens_q[1:])
-
-            # Build cu_seqlens_k from context_lens + newly written tokens
             ctx_lens = kv_cache.context_lens[:num_seqs] + seq_lens.to(torch.int32)
-            cu_seqlens_k = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
-            torch.cumsum(ctx_lens, dim=0, out=cu_seqlens_k[1:])
 
-            # Concatenate all sequences' KV
-            k_list, v_list = [], []
-            for i in range(num_seqs):
-                ctx = ctx_lens[i].item()
-                k_list.append(kv_cache.cache[i, layer_idx, 0, :ctx])
-                v_list.append(kv_cache.cache[i, layer_idx, 1, :ctx])
-            k_cat = torch.cat(k_list, dim=0).contiguous()
-            v_cat = torch.cat(v_list, dim=0).contiguous()
-
-            out = invoke_flash_attention(q, k_cat, v_cat, cu_seqlens_q, cu_seqlens_k, is_causal=False)
-        else:
-            # No cache: single sequence benchmark mode
-            num_tokens = q.size(0)
-            cu_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=x.device)
-            cu_k = torch.tensor([0, k.size(0)], dtype=torch.int32, device=x.device)
-            out = invoke_flash_attention(q, k, v, cu_q, cu_k, is_causal=False)
+            out = invoke_flash_attention(q, k_cache, v_cache, cu_seqlens_q, ctx_lens)
 
         return self.o_proj(out)
 
@@ -283,7 +268,7 @@ class Transformer(nn.Module):
         num_of_experts: int = 64,
         active_experts: int = 8,
         experts_dim: int = 128,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 128,
     ):
         super().__init__()
         self.embed_dim = head_dim * q_head
@@ -343,7 +328,7 @@ class Transformer(nn.Module):
     def generate(
         self,
         prompt_ids: torch.Tensor,
-        max_new_tokens: int = 128,
+        max_new_tokens: int = 0,
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.9,
@@ -366,8 +351,10 @@ class Transformer(nn.Module):
         device = prompt_ids.device
         kv_cache = self.create_kv_cache(num_seqs=1, device=device)
 
-        # ── Phase 1: Prefill ──
+        # If max_new_tokens=0, fill to max_seq_len
         prompt_len = prompt_ids.size(0)
+        if max_new_tokens == 0:
+            max_new_tokens = self.max_seq_len - prompt_len
         positions = torch.arange(prompt_len, device=device)
         seq_lens = torch.tensor([prompt_len], device=device, dtype=torch.int32)
         logits = self.forward(prompt_ids, positions, kv_cache, seq_lens)
@@ -432,32 +419,24 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-    model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
+    model = Transformer(num_of_layer=1).half().cuda()
 
-    # ── Test 1: Prefill (single seq, no cache) ──
-    x = torch.randint(low=0, high=1000, size=[4455]).cuda()
-    positions = torch.arange(4455).cuda()
-    logits = model.forward(x, positions)
-    print(f"Forward (no cache): input={x.shape}, output={logits.shape}")
+    # Test 1: Generate (prefill + decode, fills to max_seq_len=128)
+    prompt = torch.randint(0, 1000, [32]).cuda()
+    output = model.generate(prompt, temperature=0)
+    print(f"Generate: prompt=32, output={output.shape[0]} (generated {output.shape[0]-32})")
 
-    # ── Test 2: Generate with KV cache ──
-    prompt = torch.randint(low=0, high=1000, size=[64]).cuda()
-    output = model.generate(prompt, max_new_tokens=32, temperature=0)
-    print(f"Generate: prompt={prompt.shape[0]}, output={output.shape[0]} "
-          f"(generated {output.shape[0] - prompt.shape[0]} new tokens)")
-
-    # ── Test 3: Batched decode (4 seqs, 1 token each) ──
-    model2 = Transformer(num_of_layer=1, max_seq_len=256).half().cuda()
-    batch_kv = model2.create_kv_cache(num_seqs=4)
+    # Test 2: Batched decode (4 seqs)
+    batch_kv = model.create_kv_cache(num_seqs=4)
     for i in range(4):
-        plen = 32 + i * 16
+        plen = 16 + i * 8
         p = torch.randint(0, 1000, [plen]).cuda()
-        single_kv = model2.create_kv_cache(num_seqs=1)
-        model2.forward(p, torch.arange(plen).cuda(), single_kv, torch.tensor([plen]).cuda())
+        single_kv = model.create_kv_cache(num_seqs=1)
+        model.forward(p, torch.arange(plen).cuda(), single_kv, torch.tensor([plen]).cuda())
         batch_kv.cache[i, :, :, :plen] = single_kv.cache[0, :, :, :plen]
         batch_kv.context_lens[i] = plen
     tokens = torch.randint(0, 1000, [4]).cuda()
     positions = batch_kv.context_lens.long()
     seq_lens = torch.ones(4, dtype=torch.int32).cuda()
-    logits = model2.forward(tokens, positions, batch_kv, seq_lens)
+    logits = model.forward(tokens, positions, batch_kv, seq_lens)
     print(f"Batched decode: 4 seqs, logits={logits.shape}")

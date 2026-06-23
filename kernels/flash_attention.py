@@ -1,15 +1,8 @@
 """
-Varlen FlashAttention V2 with GQA.
+Varlen FlashAttention V2 with GQA - Zero-Copy KV Cache.
 
-Unified kernel: handles any mix of prefill and decode sequences in a single launch.
-Uses cu_seqlens (CSR format) to identify sequence boundaries.
-
-Input layout:
-  Q: [total_q_tokens, q_head, dim]   - all sequences' Q concatenated
-  K: [total_kv_tokens, kv_head, dim] - all sequences' KV concatenated
-  V: [total_kv_tokens, kv_head, dim]
-  cu_seqlens_q: [num_seqs+1] int32   - CSR offsets for Q
-  cu_seqlens_k: [num_seqs+1] int32   - CSR offsets for KV
+Reads KV directly from cache tensor [num_seqs, max_seq_len, kv_head, dim].
+No concatenation needed. Each sequence's KV is at a fixed stride offset.
 """
 
 import torch
@@ -19,13 +12,12 @@ import triton.language as tl
 
 @triton.jit
 def _flash_attn_varlen_kernel(
-    q_ptr, k_ptr, v_ptr, o_ptr,
-    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
-    tile_seq_ids_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+    cu_seqlens_q_ptr, ctx_lens_ptr, tile_seq_ids_ptr,
     total_q_len,
     stride_q_seq, stride_q_head,
-    stride_k_seq, stride_k_head,
-    stride_v_seq, stride_v_head,
+    stride_kc_seq, stride_kc_pos, stride_kc_head,  # k_cache: [num_seqs, max_len, kv_head, dim]
+    stride_vc_seq, stride_vc_pos, stride_vc_head,
     stride_o_seq, stride_o_head,
     softmax_scale: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -34,78 +26,58 @@ def _flash_attn_varlen_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
 ):
     """
-    Grid: (cdiv(total_q_len, BLOCK_M), Q_HEAD).
-
-    Each program handles BLOCK_M Q rows from one head.
-    tile_seq_ids[pid_m] tells which sequence this tile belongs to (precomputed on host).
+    Grid: (num_q_tiles, Q_HEAD).
+    Reads KV directly from per-sequence cache (no cat).
     """
     pid_m = tl.program_id(0)
     q_head_idx = tl.program_id(1)
     kv_head_idx = q_head_idx // (Q_HEAD // KV_HEAD)
 
-    # Global Q row range for this tile
     q_start = pid_m * BLOCK_M
     offs_m = q_start + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
     offs_n = tl.arange(0, BLOCK_N)
     qm_mask = offs_m < total_q_len
 
-    # Sequence lookup: O(1), precomputed on host
+    # Sequence lookup: O(1)
     seq_idx = tl.load(tile_seq_ids_ptr + pid_m).to(tl.int32)
     seq_q_start = tl.load(cu_seqlens_q_ptr + seq_idx).to(tl.int32)
     seq_q_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1).to(tl.int32)
 
-    # Get this sequence's KV range
-    seq_k_start = tl.load(cu_seqlens_k_ptr + seq_idx).to(tl.int32)
-    seq_k_end = tl.load(cu_seqlens_k_ptr + seq_idx + 1).to(tl.int32)
-    kv_seq_len = seq_k_end - seq_k_start
+    # KV length for this sequence
+    kv_seq_len = tl.load(ctx_lens_ptr + seq_idx).to(tl.int32)
     q_seq_len = seq_q_end - seq_q_start
 
-    # For causal: Q position in sequence = global_idx - seq_q_start
-    # Offset so Q aligns to end of KV: local_q + (kv_len - q_len)
-    causal_offset = kv_seq_len - q_seq_len
-
-    # ── Load Q tile [BLOCK_M, HEAD_DIM] ──
+    # Load Q tile [BLOCK_M, HEAD_DIM]
     q_base = q_ptr + q_head_idx * stride_q_head
     q = tl.load(
         q_base + offs_m[:, None] * stride_q_seq + offs_d[None, :],
         mask=qm_mask[:, None], other=0.0,
     )
 
-    # ── Online softmax state ──
+    # Online softmax state
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    # ── KV base pointers (offset to this sequence's KV start) ──
-    k_base = k_ptr + kv_head_idx * stride_k_head + seq_k_start * stride_k_seq
-    v_base = v_ptr + kv_head_idx * stride_v_head + seq_k_start * stride_v_seq
+    # KV base: directly in cache at this sequence's slot
+    k_base = k_cache_ptr + seq_idx * stride_kc_seq + kv_head_idx * stride_kc_head
+    v_base = v_cache_ptr + seq_idx * stride_vc_seq + kv_head_idx * stride_vc_head
 
-    # ── Loop over this sequence's KV blocks ──
+    # Loop over this sequence's KV
     n_blocks = tl.cdiv(kv_seq_len, BLOCK_N)
     for n_start in range(0, n_blocks * BLOCK_N, BLOCK_N):
         kn_mask = offs_n < (kv_seq_len - n_start)
 
-        # Load K [BLOCK_N, HEAD_DIM]
         k = tl.load(
-            k_base + (n_start + offs_n[:, None]) * stride_k_seq + offs_d[None, :],
+            k_base + (n_start + offs_n[:, None]) * stride_kc_pos + offs_d[None, :],
             mask=kn_mask[:, None], other=0.0,
         )
-        # S = Q @ K^T [BLOCK_M, BLOCK_N]
         s = tl.dot(q, tl.trans(k)) * softmax_scale
         s = tl.where(kn_mask[None, :], s, float("-inf"))
 
-        # Causal mask: local_q_pos + causal_offset >= local_kv_pos
-        if IS_CAUSAL:
-            local_q = offs_m - seq_q_start  # [BLOCK_M] local Q position
-            local_kv = n_start + offs_n     # [BLOCK_N] local KV position
-            causal_mask = (local_q + causal_offset)[:, None] >= local_kv[None, :]
-            s = tl.where(causal_mask, s, float("-inf"))
-
-        # Online softmax
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(s - m_new[:, None])
@@ -113,18 +85,15 @@ def _flash_attn_varlen_kernel(
         l_i = alpha * l_i + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
-        # Load V [BLOCK_N, HEAD_DIM]
         v = tl.load(
-            v_base + (n_start + offs_n[:, None]) * stride_v_seq + offs_d[None, :],
+            v_base + (n_start + offs_n[:, None]) * stride_vc_pos + offs_d[None, :],
             mask=kn_mask[:, None], other=0.0,
         )
         acc += tl.dot(p.to(COMPUTE_DTYPE), v)
         m_i = m_new
 
-    # ── Final renormalization ──
     acc = acc / l_i[:, None]
 
-    # ── Write output ──
     o_base = o_ptr + q_head_idx * stride_o_head
     tl.store(
         o_base + offs_m[:, None] * stride_o_seq + offs_d[None, :],
@@ -134,23 +103,24 @@ def _flash_attn_varlen_kernel(
 
 def invoke_flash_attention(
     q: torch.Tensor,            # [total_q, q_head, dim]
-    k: torch.Tensor,            # [total_kv, kv_head, dim]
-    v: torch.Tensor,            # [total_kv, kv_head, dim]
+    k_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
+    v_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
     cu_seqlens_q: torch.Tensor, # [num_seqs+1] int32
-    cu_seqlens_k: torch.Tensor, # [num_seqs+1] int32
-    is_causal: bool = True,
+    ctx_lens: torch.Tensor,     # [num_seqs] int32 - actual KV length per seq
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
     """
-    Varlen FlashAttention V2 with GQA.
+    Varlen FlashAttention - reads KV directly from cache (zero-copy).
 
-    Handles any mix of prefill/decode in one launch via cu_seqlens.
+    Args:
+        k_cache/v_cache: [num_seqs, max_seq_len, kv_head, dim] - cache views, no cat needed.
+        ctx_lens: [num_seqs] actual filled KV length per sequence.
 
-    Returns: [total_q, q_head * dim] contiguous.
+    Returns: [total_q, q_head * dim]
     """
     total_q_len, q_head, head_dim = q.shape
-    _, kv_head, _ = k.shape
     num_seqs = cu_seqlens_q.shape[0] - 1
+    kv_head = k_cache.shape[2]
 
     scale = softmax_scale if softmax_scale is not None else (head_dim ** -0.5)
     compute_dtype = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
@@ -161,24 +131,23 @@ def invoke_flash_attention(
     BLOCK_N = 64
     num_tiles = triton.cdiv(total_q_len, BLOCK_M)
 
-    # Precompute tile->seq mapping on host (O(1) lookup in kernel)
+    # Precompute tile->seq mapping
     tile_seq_ids = torch.searchsorted(
         cu_seqlens_q[1:], torch.arange(num_tiles, device=q.device) * BLOCK_M, right=True
     ).to(torch.int32)
 
     assert head_dim <= 128 and head_dim % 16 == 0
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    assert q.is_contiguous()
 
     grid = (num_tiles, q_head)
 
     _flash_attn_varlen_kernel[grid](
-        q, k, v, o,
-        cu_seqlens_q, cu_seqlens_k,
-        tile_seq_ids,
+        q, k_cache, v_cache, o,
+        cu_seqlens_q, ctx_lens, tile_seq_ids,
         total_q_len,
         stride_q_seq=q.stride(0), stride_q_head=q.stride(1),
-        stride_k_seq=k.stride(0), stride_k_head=k.stride(1),
-        stride_v_seq=v.stride(0), stride_v_head=v.stride(1),
+        stride_kc_seq=k_cache.stride(0), stride_kc_pos=k_cache.stride(1), stride_kc_head=k_cache.stride(2),
+        stride_vc_seq=v_cache.stride(0), stride_vc_pos=v_cache.stride(1), stride_vc_head=v_cache.stride(2),
         stride_o_seq=o.stride(0), stride_o_head=o.stride(1),
         softmax_scale=scale,
         COMPUTE_DTYPE=compute_dtype,
@@ -187,7 +156,6 @@ def invoke_flash_attention(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        IS_CAUSAL=is_causal,
     )
 
     return o.reshape(total_q_len, q_head * head_dim)

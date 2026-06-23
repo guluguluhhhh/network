@@ -14,7 +14,8 @@ import triton.language as tl
 @triton.jit
 def _attn_data_prep_kernel(
     qkv_ptr,
-    q_out_ptr, k_out_ptr, v_out_ptr,
+    q_out_ptr, k_cache_ptr, v_cache_ptr,
+    kv_write_offsets_ptr,
     gamma_q_ptr, gamma_k_ptr,
     cos_ptr, sin_ptr,
     seq_len,
@@ -22,8 +23,7 @@ def _attn_data_prep_kernel(
     stride_qkv_seq,
     stride_cos_seq,
     stride_qo_seq, stride_qo_head,
-    stride_ko_seq, stride_ko_head,
-    stride_vo_seq, stride_vo_head,
+    stride_kc_head,   # cache K/V head stride (shared for K and V)
     Q_HEAD: tl.constexpr,
     KV_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -59,9 +59,12 @@ def _attn_data_prep_kernel(
     if is_q:
         dst = q_out_ptr + pid_seq * stride_qo_seq + pid_h * stride_qo_head
     elif is_k:
-        dst = k_out_ptr + pid_seq * stride_ko_seq + (pid_h - Q_HEAD) * stride_ko_head
+        # Write directly to cache: base + per-token offset + head offset
+        write_off = tl.load(kv_write_offsets_ptr + pid_seq).to(tl.int64)
+        dst = k_cache_ptr + write_off + (pid_h - Q_HEAD) * stride_kc_head
     else:
-        dst = v_out_ptr + pid_seq * stride_vo_seq + (pid_h - Q_HEAD - KV_HEAD) * stride_vo_head
+        write_off = tl.load(kv_write_offsets_ptr + pid_seq).to(tl.int64)
+        dst = v_cache_ptr + write_off + (pid_h - Q_HEAD - KV_HEAD) * stride_kc_head
 
     x_all = tl.load(src + offs_d).to(tl.float32)
 
@@ -97,8 +100,12 @@ def invoke_attn_data_prep(
     q_head: int,
     kv_head: int,
     head_dim: int,
+    k_cache: torch.Tensor,           # [num_seqs, max_seq_len, kv_head, head_dim]
+    v_cache: torch.Tensor,           # same shape
+    kv_write_offsets: torch.Tensor,  # [num_tokens] int64 - per-token byte offset into cache
     eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
+    """Returns Q only. K/V are written directly to k_cache/v_cache at given offsets."""
     seq_len = qkv.shape[0]
     qkv_dim = qkv.shape[1]
     dev, dt = qkv.device, qkv.dtype
@@ -108,22 +115,25 @@ def invoke_attn_data_prep(
     compute_dt = tl.float16 if dt == torch.float16 else tl.bfloat16
 
     q_out = torch.empty(seq_len, q_head, head_dim, dtype=dt, device=dev)
-    k_out = torch.empty(seq_len, kv_head, head_dim, dtype=dt, device=dev)
-    v_out = torch.empty(seq_len, kv_head, head_dim, dtype=dt, device=dev)
 
     assert qkv.is_contiguous()
     assert q_head + 2 * kv_head == qkv_dim // head_dim
 
+    # Cache stride: position dim → bytes; head dim → bytes
+    # k_cache layout: [num_seqs, max_seq_len, kv_head, head_dim]
+    # stride_kc_head = stride along kv_head dim (in elements, Triton handles bytes)
+    stride_kc_head = k_cache.stride(2)
+
     grid = (seq_len, q_head + 2 * kv_head)
     _attn_data_prep_kernel[grid](
-        qkv, q_out, k_out, v_out,
+        qkv, q_out, k_cache, v_cache,
+        kv_write_offsets,
         gamma_q, gamma_k, cos, sin,
         seq_len, eps,
         stride_qkv_seq=qkv.stride(0),
         stride_cos_seq=cos.stride(0),
         stride_qo_seq=q_out.stride(0), stride_qo_head=q_out.stride(1),
-        stride_ko_seq=k_out.stride(0), stride_ko_head=k_out.stride(1),
-        stride_vo_seq=v_out.stride(0), stride_vo_head=v_out.stride(1),
+        stride_kc_head=stride_kc_head,
         Q_HEAD=q_head,
         KV_HEAD=kv_head,
         HEAD_DIM=head_dim,
@@ -136,4 +146,4 @@ def invoke_attn_data_prep(
         HALF_ROPE=half_rope,
         COMPUTE_DTYPE=compute_dt,
     )
-    return q_out, k_out, v_out
+    return q_out
