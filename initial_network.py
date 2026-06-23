@@ -200,7 +200,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
         self,
-        vocab_size: int = 220000,
+        vocab_size: int = 1000,
         num_of_layer: int = 6,
         head_dim: int = 64,
         q_head: int = 8,
@@ -220,20 +220,22 @@ class Transformer(nn.Module):
             for _ in range(num_of_layer)
         ])
         self.final_norm = nn.RMSNorm(self.embed_dim)
+        # LM Head: project hidden states to vocab logits
+        self.lm_head = nn.Linear(self.embed_dim, vocab_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [seq_len] token IDs (single sequence, no batch dim, no KV cache).
-        Returns: [seq_len, embed_dim] hidden states.
+        Returns: [seq_len, vocab_size] logits.
         """
         h = self.token_embedding(x)
         for layer in self.layers:
             h = layer(h)
         h = self.final_norm(h)
-        return h
+        return self.lm_head(h)
 
 if __name__ == "__main__":
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
-    x = torch.randint(low=0, high=220000, size=[4455]).cuda()
+    x = torch.randint(low=0, high=1000, size=[4455]).cuda()
     y = model.forward(x)
     print(y)

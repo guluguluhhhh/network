@@ -82,37 +82,30 @@ def verify_kernel_fusion():
     map_ffn_weights(orig, curr)
     print("FFN weights mapped: gate_up = cat(w_gate^T, w_up^T), down = w_down")
 
-    x = torch.randint(low=0, high=220000, size=[256]).cuda()
-
+    x = torch.randint(low=0, high=1000, size=[256]).cuda()
+    
     with torch.no_grad():
-        out_orig = orig(x)
+        out_orig = orig(x)  # [256, vocab] logits
         # Run curr with new API (positions required)
         positions = torch.arange(256).cuda()
-        out_curr = curr.forward(x, positions)
-
-    # out_curr is logits now, out_orig is hidden states - compare hidden states
-    # Re-run curr without lm_head for fair comparison
-    with torch.no_grad():
-        h = curr.token_embedding(x, positions)
-        for i, layer in enumerate(curr.layers):
-            h = layer(h, positions)
-        h = curr.final_norm(h)
-        out_curr_hidden = h
-
-    max_diff = (out_orig - out_curr_hidden).abs().max().item()
-    mean_diff = (out_orig - out_curr_hidden).abs().mean().item()
-    close = torch.allclose(out_orig, out_curr_hidden, atol=2.5e-1)
-
-    print(f"{'─'*60}")
+        out_curr = curr.forward(x, positions)  # [256, vocab] logits
+    
+    # Both now output logits - direct comparison
+    max_diff = (out_orig - out_curr).abs().max().item()
+    mean_diff = (out_orig - out_curr).abs().mean().item()
+    greedy_match = (out_orig.argmax(-1) == out_curr.argmax(-1)).all().item()
+    close = torch.allclose(out_orig, out_curr, atol=2.5e-1)
+    
+    sep = '2500' * 60; print(sep)
     print(f"Max abs diff:  {max_diff:.6e}")
     print(f"Mean abs diff: {mean_diff:.6e}")
+    print(f"Greedy match: {greedy_match}")
     print(f"allclose (atol=2.5e-1): {close}")
-    print(f"Result: {'✓ PASS' if close else '✗ FAIL'}")
+    print("Result:", "PASS" if close else "FAIL")
     if not close:
         print("Note: RoPE dims differ (32 vs 16), attention expected to diverge.")
-        print("Standalone FA kernel vs SDPA: max_err < 0.001 ✓")
-
-    del orig, curr, out_orig, out_curr_hidden, x
+    
+    del orig, curr, out_orig, out_curr, x
     torch.cuda.empty_cache()
     return close
 
@@ -134,7 +127,7 @@ def verify_kv_cache():
     model.eval()
 
     seq_len = 32  # short sequence for exact comparison
-    input_ids = torch.randint(0, 220000, (seq_len,), device=device)
+    input_ids = torch.randint(0, 1000, (seq_len,), device=device)
 
     # ── Mode A: Full prefill with KV cache (all tokens at once, causal mask) ──
     kv_cache_a = model.create_kv_cache(num_seqs=1, device=device)
@@ -210,7 +203,7 @@ def verify_batched_decode():
 
     # Create prompts of different lengths and prefill each
     prompt_lens = [32, 48, 24, 64]
-    prompts = [torch.randint(0, 220000, (L,), device=device) for L in prompt_lens]
+    prompts = [torch.randint(0, 1000, (L,), device=device) for L in prompt_lens]
 
     # Build a shared batch KV cache by prefilling each sequence
     batch_kv = model.create_kv_cache(num_seqs=num_seqs, device=device)
@@ -225,7 +218,7 @@ def verify_batched_decode():
         batch_kv.context_lens[i] = plen
 
     # Decode tokens
-    decode_tokens = torch.randint(0, 220000, (num_seqs,), device=device)
+    decode_tokens = torch.randint(0, 1000, (num_seqs,), device=device)
 
     # ── Mode A: Per-sequence single decode (reference) ──
     single_logits = []

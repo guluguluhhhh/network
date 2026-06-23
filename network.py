@@ -124,8 +124,8 @@ class Attention(nn.Module):
             cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
             torch.cumsum(seq_lens.to(torch.int32), dim=0, out=cu_seqlens_q[1:])
 
-            # Build cu_seqlens_k from context_lens (already includes new tokens)
-            ctx_lens = kv_cache.context_lens[:num_seqs]
+            # Build cu_seqlens_k from context_lens + newly written tokens
+            ctx_lens = kv_cache.context_lens[:num_seqs] + seq_lens.to(torch.int32)
             cu_seqlens_k = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
             torch.cumsum(ctx_lens, dim=0, out=cu_seqlens_k[1:])
 
@@ -138,7 +138,7 @@ class Attention(nn.Module):
             k_cat = torch.cat(k_list, dim=0).contiguous()
             v_cat = torch.cat(v_list, dim=0).contiguous()
 
-            out = invoke_flash_attention(q, k_cat, v_cat, cu_seqlens_q, cu_seqlens_k, is_causal=True)
+            out = invoke_flash_attention(q, k_cat, v_cat, cu_seqlens_q, cu_seqlens_k, is_causal=False)
         else:
             # No cache: single sequence benchmark mode
             num_tokens = q.size(0)
@@ -275,7 +275,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     def __init__(
         self,
-        vocab_size: int = 220000,
+        vocab_size: int = 1000,
         num_of_layer: int = 6,
         head_dim: int = 64,
         q_head: int = 8,
@@ -435,13 +435,13 @@ if __name__ == "__main__":
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
 
     # ── Test 1: Prefill (single seq, no cache) ──
-    x = torch.randint(low=0, high=220000, size=[4455]).cuda()
+    x = torch.randint(low=0, high=1000, size=[4455]).cuda()
     positions = torch.arange(4455).cuda()
     logits = model.forward(x, positions)
     print(f"Forward (no cache): input={x.shape}, output={logits.shape}")
 
     # ── Test 2: Generate with KV cache ──
-    prompt = torch.randint(low=0, high=220000, size=[64]).cuda()
+    prompt = torch.randint(low=0, high=1000, size=[64]).cuda()
     output = model.generate(prompt, max_new_tokens=32, temperature=0)
     print(f"Generate: prompt={prompt.shape[0]}, output={output.shape[0]} "
           f"(generated {output.shape[0] - prompt.shape[0]} new tokens)")
@@ -451,12 +451,12 @@ if __name__ == "__main__":
     batch_kv = model2.create_kv_cache(num_seqs=4)
     for i in range(4):
         plen = 32 + i * 16
-        p = torch.randint(0, 220000, [plen]).cuda()
+        p = torch.randint(0, 1000, [plen]).cuda()
         single_kv = model2.create_kv_cache(num_seqs=1)
         model2.forward(p, torch.arange(plen).cuda(), single_kv, torch.tensor([plen]).cuda())
         batch_kv.cache[i, :, :, :plen] = single_kv.cache[0, :, :, :plen]
         batch_kv.context_lens[i] = plen
-    tokens = torch.randint(0, 220000, [4]).cuda()
+    tokens = torch.randint(0, 1000, [4]).cuda()
     positions = batch_kv.context_lens.long()
     seq_lens = torch.ones(4, dtype=torch.int32).cuda()
     logits = model2.forward(tokens, positions, batch_kv, seq_lens)
