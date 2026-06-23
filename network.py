@@ -17,49 +17,6 @@ from kernels.flash_attention import invoke_flash_attention
 from kernels.skip_rmsnorm import invoke_skip_rmsnorm
 from components import KVCache
 
-
-class RopeEmbedding(nn.Module):
-    """Partial RoPE applied only to the last 32 dimensions of each head."""
-
-    def __init__(self, head_dim: int, max_seq_len: int = 2048, rope_dim: int = 32):
-        super().__init__()
-        self.head_dim = head_dim
-        self.rope_dim = rope_dim
-        assert rope_dim <= head_dim, "rope_dim cannot exceed head_dim"
-        assert rope_dim % 2 == 0, "rope_dim must be even"
-
-        # Precompute sin/cos for the rope dimensions
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
-        t = torch.arange(max_seq_len).float()
-        freqs = torch.outer(t, inv_freq)  # [max_seq_len, rope_dim // 2]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [max_seq_len, rope_dim]
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """
-        x: [batch, seq_len, num_heads, head_dim] or [seq_len, num_heads, head_dim]
-        Applies RoPE only to the LAST rope_dim dimensions; leaves the rest unchanged.
-        """
-        cos = self.cos_cached[:seq_len].to(x.dtype)  # [seq_len, rope_dim]
-        sin = self.sin_cached[:seq_len].to(x.dtype)
-
-        # Reshape for broadcasting: [seq_len, 1, rope_dim]
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-
-        # Split: non-rope prefix | rope suffix
-        prefix = x[..., : self.head_dim - self.rope_dim]
-        suffix = x[..., self.head_dim - self.rope_dim :]
-
-        # Standard rotary embedding on suffix
-        d = suffix.shape[-1]
-        x1, x2 = suffix[..., : d // 2], suffix[..., d // 2 :]
-        rotated = torch.cat([-x2, x1], dim=-1) * sin + suffix * cos
-
-        return torch.cat([prefix, rotated], dim=-1)
-
-
 class TokenEmbedding(nn.Module):
     """Token embedding lookup + learned position embedding + LayerNorm."""
 
@@ -69,26 +26,20 @@ class TokenEmbedding(nn.Module):
         self.pos_emb = nn.Embedding(max_seq_len, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, input_ids: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
-        """input_ids: [seq_len] → output: [seq_len, embed_dim]
-
-        Args:
-            position_offset: starting position for position embeddings.
-                             0 for prefill, kv_cache.seq_len for decode.
-        """
-        seq_len = input_ids.size(0)
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """input_ids: [num_tokens], positions: [num_tokens] -> [num_tokens, embed_dim]"""
+        num_tokens = input_ids.size(0)
         embed_dim = self.token_emb.weight.shape[1]
         output = torch.empty(
-            seq_len, embed_dim,
+            num_tokens, embed_dim,
             dtype=self.token_emb.weight.dtype,
             device=input_ids.device,
         )
-        # Slice pos_emb_weight so kernel's pid=0 maps to position_offset
-        pos_emb_weight = self.pos_emb.weight[position_offset:]
         invoke_fused_embedding_layernorm(
             input_ids=input_ids,
+            position_ids=positions,
             token_emb_weight=self.token_emb.weight,
-            pos_emb_weight=pos_emb_weight,
+            pos_emb_weight=self.pos_emb.weight,
             ln_weight=self.norm.weight,
             ln_bias=self.norm.bias,
             output=output,
@@ -130,31 +81,28 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        positions: torch.Tensor,
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """x: [seq_len, embed_dim] → [seq_len, embed_dim]
+        """x: [num_tokens, embed_dim] → [num_tokens, embed_dim]
 
         Args:
+            positions: [num_tokens] absolute position per token.
             layer_idx: index of this layer in the model (for kv_cache addressing).
             kv_cache: if provided, uses KV cache for incremental decoding.
-                      - prefill: writes all K/V to cache, uses causal attn.
-                      - decode: writes new K/V, attends to full cached history.
+            seq_lens: [num_seqs] tokens per sequence in this forward call.
         """
-        seq_len = x.size(0)
-
-        # Position offset: where in the sequence are we?
-        if kv_cache is not None:
-            position_offset = kv_cache.seq_len
-        else:
-            position_offset = 0
+        num_tokens = x.size(0)
+        num_seqs = seq_lens.size(0) if seq_lens is not None else 1
 
         # Single fused GEMM for Q, K, V
         qkv = self.qkv_proj(x)
 
         # ── Kernel 1: Data preparation with position-aware RoPE ──
-        cos = self.cos_cached[position_offset:position_offset + seq_len]
-        sin = self.sin_cached[position_offset:position_offset + seq_len]
+        cos = self.cos_cached[positions.long()]
+        sin = self.sin_cached[positions.long()]
         q, k, v = invoke_attn_data_prep(
             qkv, cos, sin,
             self.q_norm.weight, self.k_norm.weight,
@@ -163,24 +111,40 @@ class Attention(nn.Module):
 
         # ── KV Cache handling ──
         if kv_cache is not None:
-            # Write new K/V to cache
-            kv_cache.update(layer_idx, k, v)
-            # Read full history (including newly written)
-            # Note: seq_len hasn't advanced yet, so we read [0:seq_len+new]
-            # We manually include new tokens by reading up to current write position
-            total_len = position_offset + seq_len
-            k_full = kv_cache.cache[layer_idx, 0, :total_len].contiguous()
-            v_full = kv_cache.cache[layer_idx, 1, :total_len].contiguous()
-        else:
-            k_full = k
-            v_full = v
+            # Write K/V to cache per sequence
+            token_offset = 0
+            for i in range(num_seqs):
+                slen = seq_lens[i].item()
+                kv_cache.update(layer_idx, i, k[token_offset:token_offset+slen], v[token_offset:token_offset+slen])
+                token_offset += slen
 
-        # ── Kernel 2: FlashAttention V2 with GQA ──
-        # prefill with cache: causal mask needed
-        # decode (seq_len=1): no causal needed (single Q attends to all history)
-        # no cache: no causal (original benchmark behavior)
-        is_causal = (kv_cache is not None) and (seq_len > 1)
-        out = invoke_flash_attention(q, k_full, v_full, is_causal=is_causal)
+            # ── Kernel 2: Varlen FlashAttention (one launch for all seqs) ──
+            # Build cu_seqlens_q from seq_lens
+            device = x.device
+            cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
+            torch.cumsum(seq_lens.to(torch.int32), dim=0, out=cu_seqlens_q[1:])
+
+            # Build cu_seqlens_k from context_lens (already includes new tokens)
+            ctx_lens = kv_cache.context_lens[:num_seqs]
+            cu_seqlens_k = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
+            torch.cumsum(ctx_lens, dim=0, out=cu_seqlens_k[1:])
+
+            # Concatenate all sequences' KV
+            k_list, v_list = [], []
+            for i in range(num_seqs):
+                ctx = ctx_lens[i].item()
+                k_list.append(kv_cache.cache[i, layer_idx, 0, :ctx])
+                v_list.append(kv_cache.cache[i, layer_idx, 1, :ctx])
+            k_cat = torch.cat(k_list, dim=0).contiguous()
+            v_cat = torch.cat(v_list, dim=0).contiguous()
+
+            out = invoke_flash_attention(q, k_cat, v_cat, cu_seqlens_q, cu_seqlens_k, is_causal=True)
+        else:
+            # No cache: single sequence benchmark mode
+            num_tokens = q.size(0)
+            cu_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=x.device)
+            cu_k = torch.tensor([0, k.size(0)], dtype=torch.int32, device=x.device)
+            out = invoke_flash_attention(q, k, v, cu_q, cu_k, is_causal=False)
 
         return self.o_proj(out)
 
@@ -289,11 +253,13 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        positions: torch.Tensor,
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # attn_norm + attention
-        attn_out = self.attn(self.attn_norm(x), layer_idx=layer_idx, kv_cache=kv_cache)
+        attn_out = self.attn(self.attn_norm(x), positions, layer_idx=layer_idx, kv_cache=kv_cache, seq_lens=seq_lens)
 
         # skip_rmsnorm: fused x+=attn_out + ffn_norm → 1 kernel (was 2)
         ffn_in = invoke_skip_rmsnorm(x, attn_out, self.ffn_norm.weight)
@@ -338,29 +304,33 @@ class Transformer(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        x: [seq_len] token IDs (single sequence, no batch dim).
-        kv_cache: if provided, uses incremental KV cache.
-        Returns: [seq_len, vocab_size] logits.
+        Token-flat forward (vLLM V1 style).
+        input_ids: [num_tokens], positions: [num_tokens],
+        kv_cache: multi-seq cache, seq_lens: [num_seqs].
+        Returns: [num_tokens, vocab_size] logits.
         """
-        h = self.token_embedding(x, position_offset=kv_cache.seq_len if kv_cache is not None else 0)
+        h = self.token_embedding(input_ids, positions)
         for i, layer in enumerate(self.layers):
-            h = layer(h, layer_idx=i, kv_cache=kv_cache)
+            h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, seq_lens=seq_lens)
         h = self.final_norm(h)
         logits = self.lm_head(h)
 
         # Advance cache after all layers processed
-        if kv_cache is not None:
-            kv_cache.advance(x.size(0))
+        if kv_cache is not None and seq_lens is not None:
+            kv_cache.advance(seq_lens)
 
         return logits
 
-    def create_kv_cache(self, device: str = "cuda") -> KVCache:
-        """Create a fresh KV cache for this model."""
+    def create_kv_cache(self, num_seqs: int = 1, device: str = "cuda") -> KVCache:
+        """Create a fresh KV cache."""
         return KVCache(
+            num_seqs=num_seqs,
             num_layers=self.num_of_layer,
             max_seq_len=self.max_seq_len,
             kv_head=self.kv_head,
@@ -394,12 +364,13 @@ class Transformer(nn.Module):
             [prompt_len + generated_len] full sequence of token IDs.
         """
         device = prompt_ids.device
-        kv_cache = self.create_kv_cache(device=device)
+        kv_cache = self.create_kv_cache(num_seqs=1, device=device)
 
         # ── Phase 1: Prefill ──
-        # Run entire prompt through the model, filling the KV cache
-        logits = self.forward(prompt_ids, kv_cache=kv_cache)  # [prompt_len, vocab]
-        # Only the last token's logits are used for next-token prediction
+        prompt_len = prompt_ids.size(0)
+        positions = torch.arange(prompt_len, device=device)
+        seq_lens = torch.tensor([prompt_len], device=device, dtype=torch.int32)
+        logits = self.forward(prompt_ids, positions, kv_cache, seq_lens)
         next_token_logits = logits[-1]  # [vocab]
 
         generated_ids = [prompt_ids]
@@ -416,7 +387,9 @@ class Transformer(nn.Module):
                 break
 
             # Run single token through model with KV cache
-            logits = self.forward(next_token.unsqueeze(0), kv_cache=kv_cache)  # [1, vocab]
+            pos = kv_cache.context_lens[0:1].long()
+            sl = torch.ones(1, device=device, dtype=torch.int32)
+            logits = self.forward(next_token.unsqueeze(0), pos, kv_cache, sl)
             next_token_logits = logits[0]  # [vocab]
 
         return torch.cat(generated_ids, dim=0)
@@ -461,13 +434,30 @@ class Transformer(nn.Module):
 if __name__ == "__main__":
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
 
-    # ── Test 1: Original forward (no cache, benchmark mode) ──
+    # ── Test 1: Prefill (single seq, no cache) ──
     x = torch.randint(low=0, high=220000, size=[4455]).cuda()
-    logits = model.forward(x)
+    positions = torch.arange(4455).cuda()
+    logits = model.forward(x, positions)
     print(f"Forward (no cache): input={x.shape}, output={logits.shape}")
 
     # ── Test 2: Generate with KV cache ──
     prompt = torch.randint(low=0, high=220000, size=[64]).cuda()
-    output = model.generate(prompt, max_new_tokens=32, temperature=0.8)
+    output = model.generate(prompt, max_new_tokens=32, temperature=0)
     print(f"Generate: prompt={prompt.shape[0]}, output={output.shape[0]} "
           f"(generated {output.shape[0] - prompt.shape[0]} new tokens)")
+
+    # ── Test 3: Batched decode (4 seqs, 1 token each) ──
+    model2 = Transformer(num_of_layer=1, max_seq_len=256).half().cuda()
+    batch_kv = model2.create_kv_cache(num_seqs=4)
+    for i in range(4):
+        plen = 32 + i * 16
+        p = torch.randint(0, 220000, [plen]).cuda()
+        single_kv = model2.create_kv_cache(num_seqs=1)
+        model2.forward(p, torch.arange(plen).cuda(), single_kv, torch.tensor([plen]).cuda())
+        batch_kv.cache[i, :, :, :plen] = single_kv.cache[0, :, :, :plen]
+        batch_kv.context_lens[i] = plen
+    tokens = torch.randint(0, 220000, [4]).cuda()
+    positions = batch_kv.context_lens.long()
+    seq_lens = torch.ones(4, dtype=torch.int32).cuda()
+    logits = model2.forward(tokens, positions, batch_kv, seq_lens)
+    print(f"Batched decode: 4 seqs, logits={logits.shape}")

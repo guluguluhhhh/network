@@ -21,7 +21,8 @@ def fused_embedding_layernorm_kernel(
     ln_weight_ptr,       # [embed_dim]
     ln_bias_ptr,         # [embed_dim] or dummy
     # Input
-    input_ids_ptr,       # [seq_len] int64
+    input_ids_ptr,       # [num_tokens] int64
+    position_ids_ptr,    # [num_tokens] int64
     # Dimensions (constexpr for efficient indexing)
     embed_dim: tl.constexpr,
     # Strides
@@ -43,6 +44,7 @@ def fused_embedding_layernorm_kernel(
     pid = tl.program_id(0)
 
     token_id = tl.load(input_ids_ptr + pid).to(tl.int64)
+    pos_id = tl.load(position_ids_ptr + pid).to(tl.int64)
 
     # Precompute offset ranges used by both passes
     offs = tl.arange(0, BLOCK_SIZE)
@@ -60,7 +62,7 @@ def fused_embedding_layernorm_kernel(
             mask=mask, other=0.0,
         )
         p_val = tl.load(
-            pos_emb_ptr + pid * stride_pos_emb_0 + offsets,
+            pos_emb_ptr + pos_id * stride_pos_emb_0 + offsets,
             mask=mask, other=0.0,
         )
 
@@ -82,7 +84,7 @@ def fused_embedding_layernorm_kernel(
             mask=mask, other=0.0,
         )
         p_val = tl.load(
-            pos_emb_ptr + pid * stride_pos_emb_0 + offsets,
+            pos_emb_ptr + pos_id * stride_pos_emb_0 + offsets,
             mask=mask, other=0.0,
         )
 
@@ -106,12 +108,13 @@ def fused_embedding_layernorm_kernel(
 
 
 def invoke_fused_embedding_layernorm(
-    input_ids: torch.Tensor,        # [seq_len] int64
+    input_ids: torch.Tensor,        # [num_tokens] int64
+    position_ids: torch.Tensor,     # [num_tokens] int64
     token_emb_weight: torch.Tensor, # [vocab_size, embed_dim]
     pos_emb_weight: torch.Tensor,   # [max_seq_len, embed_dim]
     ln_weight: torch.Tensor,        # [embed_dim]
     ln_bias: torch.Tensor | None,   # [embed_dim] or None
-    output: torch.Tensor,           # [seq_len, embed_dim] pre-allocated
+    output: torch.Tensor,           # [num_tokens, embed_dim] pre-allocated
     eps: float = 1e-5,
 ) -> None:
     """
@@ -143,6 +146,7 @@ def invoke_fused_embedding_layernorm(
         ln_weight,
         ln_bias if has_bias else ln_weight,  # dummy pointer, never accessed
         input_ids,
+        position_ids,
         embed_dim=embed_dim,
         stride_token_emb_0=token_emb_weight.stride(0),
         stride_pos_emb_0=pos_emb_weight.stride(0),
