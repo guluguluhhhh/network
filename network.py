@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from dataclasses import dataclass
 from typing import Optional
 import triton.language as tl
 from kernels.fused_moe_kernel import (
@@ -16,6 +17,21 @@ from kernels.attn_data_prep import invoke_attn_data_prep
 from kernels.flash_attention import invoke_flash_attention
 from kernels.skip_rmsnorm import invoke_skip_rmsnorm
 from components import KVCache
+
+
+@dataclass
+class AttentionMetadata:
+    """Scheduler-precomputed attention metadata. Zero GPU compute at runtime."""
+    positions: torch.Tensor       # [num_tokens] absolute position per token
+    seq_ids: torch.Tensor         # [num_tokens] int64 - which seq each token belongs to
+    cu_seqlens_q: torch.Tensor    # [num_seqs+1] int32 - cumulative Q token boundaries
+    ctx_lens: torch.Tensor        # [num_seqs] int32 - total KV len per seq (context + new)
+    context_lens: torch.Tensor    # [num_seqs] int32 - existing context lengths
+    num_decode_seqs: int          # split index for decode/prefill routing
+    num_decode_tokens: int        # total Q tokens for decode part (avoids .item() D2H)
+    max_kv_len: int               # max KV length across all seqs (avoids .max().item() D2H)
+    cu_seqlens_prefill: Optional[torch.Tensor] = None  # pre-rebased cu_seqlens for prefill (avoids subtraction)
+    tile_seq_ids_prefill: Optional[torch.Tensor] = None  # [num_tiles] int32 - tile-to-seq mapping for prefill FA
 
 class TokenEmbedding(nn.Module):
     """Token embedding lookup + learned position embedding + LayerNorm."""
@@ -81,59 +97,47 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        num_decode_seqs: int = 0,
+        metadata: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
         """x: [num_tokens, embed_dim] → [num_tokens, embed_dim]
 
-        Args:
-            positions: [num_tokens] absolute position per token.
-            layer_idx: index of this layer in the model (for kv_cache addressing).
-            kv_cache: if provided, uses KV cache for incremental decoding.
-            seq_lens: [num_seqs] tokens per sequence in this forward call.
-            num_decode_seqs: split index (decode seqs first, prefill seqs after).
+        All metadata (positions, seq_ids, cu_seqlens_q, ctx_lens) is
+        pre-computed by the scheduler and passed via AttentionMetadata.
+        Attention.forward has ZERO metadata computation.
         """
-        num_tokens = x.size(0)
-        num_seqs = seq_lens.size(0) if seq_lens is not None else 1
+        num_seqs = metadata.cu_seqlens_q.size(0) - 1
 
-        # Single fused GEMM for Q, K, V
+        # Op 1: QKV GEMM
         qkv = self.qkv_proj(x)
 
-        # RoPE cos/sin indexed by positions
-        cos = self.cos_cached[positions.long()]
-        sin = self.sin_cached[positions.long()]
-
         if kv_cache is not None:
-            # Compute per-token byte offsets for direct cache write
-            device = x.device
-            k_cache = kv_cache.cache[:num_seqs, layer_idx, 0]  # [num_seqs, max_len, kv_head, dim]
+            # Cache views (pure view, zero kernel launch)
+            k_cache = kv_cache.cache[:num_seqs, layer_idx, 0]
             v_cache = kv_cache.cache[:num_seqs, layer_idx, 1]
 
-            # Per-token write offsets into cache (vectorized)
-            seq_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), seq_lens.long())
-            local_offsets = torch.cat([torch.arange(s, device=device) for s in seq_lens.tolist()])
-            write_positions = kv_cache.context_lens[seq_ids] + local_offsets
-            kv_write_offsets = (seq_ids * k_cache.stride(0) + write_positions * k_cache.stride(1)).to(torch.int64)
-
-            # attn_data_prep: Q to fresh tensor, K/V directly to cache
+            # Op 2: attn_data_prep — all metadata pre-computed by scheduler
             q = invoke_attn_data_prep(
-                qkv, cos, sin,
+                qkv, self.cos_cached, self.sin_cached,
+                metadata.positions, metadata.seq_ids,
                 self.q_norm.weight, self.k_norm.weight,
                 self.q_head, self.kv_head, self.head_dim,
-                k_cache, v_cache, kv_write_offsets,
+                k_cache, v_cache,
             )
 
-            # Attention: read KV directly from cache (zero-copy)
-            cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
-            torch.cumsum(seq_lens.to(torch.int32), dim=0, out=cu_seqlens_q[1:])
-            ctx_lens = kv_cache.context_lens[:num_seqs] + seq_lens.to(torch.int32)
+            # Op 3: flash_attention — all metadata pre-computed by scheduler
+            out = invoke_flash_attention(
+                q, k_cache, v_cache,
+                metadata.cu_seqlens_q, metadata.ctx_lens,
+                num_decode_seqs=metadata.num_decode_seqs,
+                num_decode_tokens=metadata.num_decode_tokens,
+                max_kv_len=metadata.max_kv_len,
+                cu_seqlens_prefill=metadata.cu_seqlens_prefill,
+                tile_seq_ids_prefill=metadata.tile_seq_ids_prefill,
+            )
 
-            out = invoke_flash_attention(q, k_cache, v_cache, cu_seqlens_q, ctx_lens,
-                                        num_decode_seqs=num_decode_seqs)
-
+        # Op 4: O projection GEMM
         return self.o_proj(out)
 
 
@@ -244,11 +248,10 @@ class TransformerBlock(nn.Module):
         positions: torch.Tensor,
         layer_idx: int = 0,
         kv_cache: Optional[KVCache] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        num_decode_seqs: int = 0,
+        metadata: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
         # attn_norm + attention
-        attn_out = self.attn(self.attn_norm(x), positions, layer_idx=layer_idx, kv_cache=kv_cache, seq_lens=seq_lens, num_decode_seqs=num_decode_seqs)
+        attn_out = self.attn(self.attn_norm(x), layer_idx=layer_idx, kv_cache=kv_cache, metadata=metadata)
 
         # skip_rmsnorm: fused x+=attn_out + ffn_norm → 1 kernel (was 2)
         ffn_in = invoke_skip_rmsnorm(x, attn_out, self.ffn_norm.weight)
@@ -306,9 +309,12 @@ class Transformer(nn.Module):
         num_decode_seqs: split index (decode first, prefill after).
         Returns: [num_tokens, vocab_size] logits.
         """
+        # ── Scheduler pre-computes all attention metadata (zero per-layer cost) ──
+        metadata = self._build_metadata(positions, kv_cache, seq_lens, num_decode_seqs)
+
         h = self.token_embedding(input_ids, positions)
         for i, layer in enumerate(self.layers):
-            h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, seq_lens=seq_lens, num_decode_seqs=num_decode_seqs)
+            h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, metadata=metadata)
         h = self.final_norm(h)
         logits = self.lm_head(h)
 
@@ -317,6 +323,75 @@ class Transformer(nn.Module):
             kv_cache.advance(seq_lens)
 
         return logits
+
+    def _build_metadata(
+        self,
+        positions: torch.Tensor,
+        kv_cache: Optional[KVCache],
+        seq_lens: Optional[torch.Tensor],
+        num_decode_seqs: int,
+    ) -> Optional[AttentionMetadata]:
+        """Simulate scheduler: pre-compute ALL attention metadata on GPU once.
+
+        In production, this would be computed on CPU by the scheduler and
+        uploaded as part of the batch descriptor — zero GPU compute.
+        """
+        if kv_cache is None or seq_lens is None:
+            return None
+
+        device = positions.device
+        num_seqs = seq_lens.size(0)
+        num_tokens = positions.size(0)
+
+        # seq_ids: which sequence each token belongs to
+        seq_ids = torch.repeat_interleave(
+            torch.arange(num_seqs, device=device, dtype=torch.int64), seq_lens.long()
+        )
+
+        # cu_seqlens_q: cumulative Q token boundaries
+        cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
+        cu_seqlens_q[1:] = seq_lens.to(torch.int32).cumsum(0)
+
+        # ctx_lens: total KV length per seq after this forward
+        context_lens = kv_cache.context_lens[:num_seqs]
+        ctx_lens = context_lens + seq_lens.to(torch.int32)
+
+        # Scalars the FA wrapper needs (avoids D2H syncs at runtime)
+        num_decode_tokens = int(seq_lens[:num_decode_seqs].sum().item()) if num_decode_seqs > 0 else 0
+        max_kv_len = int(ctx_lens.max().item()) if num_seqs > 0 else 0
+
+        # Pre-rebased cu_seqlens for prefill subset (avoids elementwise subtraction)
+        num_prefill_seqs = num_seqs - num_decode_seqs
+        cu_seqlens_prefill = None
+        tile_seq_ids_prefill = None
+        if num_prefill_seqs > 0:
+            if num_decode_seqs > 0:
+                cu_seqlens_prefill = cu_seqlens_q[num_decode_seqs:] - cu_seqlens_q[num_decode_seqs]
+            else:
+                cu_seqlens_prefill = cu_seqlens_q  # no rebase needed
+            # Pre-compute tile_seq_ids for prefill FA (avoids arange+mul+searchsorted+cast at runtime)
+            total_prefill_tokens = num_tokens - num_decode_tokens
+            BLOCK_M = 128
+            import triton
+            num_tiles = triton.cdiv(total_prefill_tokens, BLOCK_M)
+            tile_seq_ids_prefill = torch.searchsorted(
+                cu_seqlens_prefill[1:],
+                torch.arange(num_tiles, device=device) * BLOCK_M,
+                right=True,
+            ).to(torch.int32)
+
+        return AttentionMetadata(
+            positions=positions,
+            seq_ids=seq_ids,
+            cu_seqlens_q=cu_seqlens_q,
+            ctx_lens=ctx_lens,
+            context_lens=context_lens,
+            num_decode_seqs=num_decode_seqs,
+            num_decode_tokens=num_decode_tokens,
+            max_kv_len=max_kv_len,
+            cu_seqlens_prefill=cu_seqlens_prefill,
+            tile_seq_ids_prefill=tile_seq_ids_prefill,
+        )
 
     def create_kv_cache(self, num_seqs: int = 1, device: str = "cuda") -> KVCache:
         """Create a fresh KV cache."""

@@ -229,7 +229,7 @@ def _flash_decode_reduce_kernel(
 # Python wrappers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_scale):
+def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_scale, tile_seq_ids):
     """Prefill path: varlen kernel."""
     total_q_len, q_head, head_dim = q.shape
     kv_head = k_cache.shape[2]
@@ -239,9 +239,8 @@ def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_s
     BLOCK_M, BLOCK_N = 128, 128
     num_tiles = triton.cdiv(total_q_len, BLOCK_M)
 
-    tile_seq_ids = torch.searchsorted(
-        cu_seqlens_q[1:], torch.arange(num_tiles, device=q.device) * BLOCK_M, right=True
-    ).to(torch.int32)
+    # tile_seq_ids pre-computed by scheduler — zero runtime ops
+    assert tile_seq_ids is not None and tile_seq_ids.shape[0] == num_tiles
 
     assert q.is_contiguous()
     _flash_attn_prefill_kernel[(num_tiles, q_head)](
@@ -260,15 +259,15 @@ def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_s
     return o.reshape(total_q_len, q_head * head_dim)
 
 
-def _invoke_flash_decode(q, k_cache, v_cache, ctx_lens, softmax_scale):
+def _invoke_flash_decode(q, k_cache, v_cache, ctx_lens, softmax_scale, max_kv_len: int):
     """Decode path: FlashDecoding with split-KV + reduce."""
     batch_size, q_head, head_dim = q.shape
     kv_head = k_cache.shape[2]
     compute_dtype = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
-    max_kv = ctx_lens.max().item()
-    NUM_SPLITS = max(1, triton.cdiv(max_kv, 256))
-    SPLIT_SIZE = triton.cdiv(max_kv, NUM_SPLITS)
+    # max_kv_len pre-computed by scheduler — zero D2H sync
+    NUM_SPLITS = max(1, triton.cdiv(max_kv_len, 256))
+    SPLIT_SIZE = triton.cdiv(max_kv_len, NUM_SPLITS)
     BLOCK_N = 128
 
     # Allocate partial buffers
@@ -314,44 +313,54 @@ def invoke_flash_attention(
     q: torch.Tensor,            # [total_q, q_head, dim]
     k_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
     v_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
-    cu_seqlens_q: torch.Tensor, # [num_seqs+1] int32
-    ctx_lens: torch.Tensor,     # [num_seqs] int32
+    cu_seqlens_q: torch.Tensor, # [num_seqs+1] int32 - scheduler-precomputed
+    ctx_lens: torch.Tensor,     # [num_seqs] int32 - scheduler-precomputed
     num_decode_seqs: int = 0,   # split index: seqs[:num_decode] are decode, seqs[num_decode:] are prefill
+    num_decode_tokens: int = 0, # total decode Q tokens (avoids .item() D2H)
+    max_kv_len: int = 0,        # max KV length (avoids .max().item() D2H)
+    cu_seqlens_prefill: torch.Tensor | None = None,  # pre-rebased (avoids subtraction)
+    tile_seq_ids_prefill: torch.Tensor | None = None,  # pre-computed tile-to-seq mapping
     softmax_scale: float | None = None,
 ) -> torch.Tensor:
     """
     Unified attention with index-based routing.
     Batch layout: [decode_seqs | prefill_seqs]
-    num_decode_seqs splits the two regions.
+
+    Zero D2H sync, zero elementwise ops: all scalars and derived tensors
+    are pre-computed by the scheduler.
     Returns: [total_q, q_head * dim]
     """
+    total_q = q.shape[0]
     head_dim = q.shape[2]
+    q_head = q.shape[1]
     scale = softmax_scale if softmax_scale is not None else (head_dim ** -0.5)
     num_seqs = cu_seqlens_q.shape[0] - 1
 
-    outputs = []
+    # Pre-allocate output (avoids torch.cat for mixed batch)
+    out = torch.empty(total_q, q_head * head_dim, dtype=q.dtype, device=q.device)
 
     # Decode part: seqs [0, num_decode_seqs)
     if num_decode_seqs > 0:
-        q_end = cu_seqlens_q[num_decode_seqs].item()
-        q_decode = q[:q_end]  # [num_decode_seqs, q_head, dim] since each has 1 token
+        q_decode = q[:num_decode_tokens]
         k_decode = k_cache[:num_decode_seqs]
         v_decode = v_cache[:num_decode_seqs]
         ctx_decode = ctx_lens[:num_decode_seqs]
-        out_decode = _invoke_flash_decode(q_decode, k_decode, v_decode, ctx_decode, scale)
-        outputs.append(out_decode)
+        out[:num_decode_tokens] = _invoke_flash_decode(
+            q_decode, k_decode, v_decode, ctx_decode, scale, max_kv_len
+        )
 
     # Prefill part: seqs [num_decode_seqs, num_seqs)
     num_prefill_seqs = num_seqs - num_decode_seqs
     if num_prefill_seqs > 0:
-        q_start = cu_seqlens_q[num_decode_seqs].item()
-        q_prefill = q[q_start:]  # remaining Q tokens
+        q_prefill = q[num_decode_tokens:]
         k_prefill = k_cache[num_decode_seqs:num_seqs]
         v_prefill = v_cache[num_decode_seqs:num_seqs]
         ctx_prefill = ctx_lens[num_decode_seqs:num_seqs]
-        # Rebuild cu_seqlens_q for prefill subset (re-base to 0)
-        cu_prefill = cu_seqlens_q[num_decode_seqs:] - cu_seqlens_q[num_decode_seqs]
-        out_prefill = _invoke_flash_prefill(q_prefill, k_prefill, v_prefill, cu_prefill, ctx_prefill, scale)
-        outputs.append(out_prefill)
+        # Use pre-rebased cu_seqlens if available, otherwise cu_seqlens_q itself (offset=0)
+        cu_prefill = cu_seqlens_prefill if cu_seqlens_prefill is not None else cu_seqlens_q
+        out[num_decode_tokens:] = _invoke_flash_prefill(
+            q_prefill, k_prefill, v_prefill, cu_prefill, ctx_prefill, scale,
+            tile_seq_ids_prefill,
+        )
 
-    return torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
+    return out
