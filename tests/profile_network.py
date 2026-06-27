@@ -14,19 +14,21 @@ from torch.profiler import profile, ProfilerActivity, record_function
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from network import Transformer
+from components import Scheduler
 
 
 def profile_execution():
     """Use torch.profiler to trace operator execution times."""
     model = Transformer(num_of_layer=1, max_seq_len=8192).half().cuda()
+    scheduler = Scheduler(model, max_batch_size=1)
     seq_len = 4096
     x = torch.randint(0, 1000, [seq_len]).cuda()
     positions = torch.arange(seq_len).cuda()
     seq_lens = torch.tensor([seq_len], dtype=torch.int32).cuda()
 
     def run_forward():
-        kv = model.create_kv_cache(num_seqs=1)
-        return model.forward(x, positions, kv, seq_lens)
+        scheduler.kv_cache.context_lens[:] = 0
+        return scheduler.step(x, positions, seq_lens)
 
     # Warmup
     for i in range(10):
@@ -132,6 +134,7 @@ def profile_execution():
 def profile_memory_per_operator():
     """Track GPU memory allocation per operator using hooks."""
     model = Transformer(num_of_layer=1).half().cuda()
+    scheduler = Scheduler(model, max_batch_size=1)
     seq_len = 64
     x = torch.randint(0, 1000, [seq_len]).cuda()
     positions = torch.arange(seq_len).cuda()
@@ -177,7 +180,7 @@ def profile_memory_per_operator():
     print(f"Base memory (model weights + input): {base_mem:.2f} MB")
     print(f"{'=' * 100}")
 
-    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
+    _ = scheduler.step(x, positions, seq_lens_t)
     torch.cuda.synchronize()
 
     peak_mem = torch.cuda.max_memory_allocated() / 1024**2
@@ -211,13 +214,15 @@ def profile_memory_per_operator():
 def profile_memory_snapshot():
     """Use torch.cuda.memory._record_memory_history for detailed allocation tracking."""
     model = Transformer(num_of_layer=1).half().cuda()
+    scheduler = Scheduler(model, max_batch_size=1)
     seq_len = 64
     x = torch.randint(0, 1000, [seq_len]).cuda()
     positions = torch.arange(seq_len).cuda()
     seq_lens_t = torch.tensor([seq_len], dtype=torch.int32).cuda()
 
     # Warmup
-    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
+    scheduler.kv_cache.context_lens[:] = 0
+    _ = scheduler.step(x, positions, seq_lens_t)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -225,7 +230,8 @@ def profile_memory_snapshot():
     # Record memory history
     torch.cuda.memory._record_memory_history(max_entries=100000)
 
-    _ = model.forward(x, positions, model.create_kv_cache(num_seqs=1), seq_lens_t)
+    scheduler.kv_cache.context_lens[:] = 0
+    _ = scheduler.step(x, positions, seq_lens_t)
     torch.cuda.synchronize()
 
     # Export snapshot

@@ -15,7 +15,7 @@ from kernels.fused_moe_kernel import (
 from kernels.fused_embedding_kernel import invoke_fused_embedding_layernorm
 from kernels.attn_data_prep import invoke_attn_data_prep
 from kernels.flash_attention import invoke_flash_attention
-from kernels.skip_rmsnorm import invoke_skip_rmsnorm
+from kernels.skip_rmsnorm import invoke_skip_rmsnorm, invoke_rmsnorm
 from components import KVCache
 
 
@@ -237,7 +237,7 @@ class TransformerBlock(nn.Module):
     def __init__(self, head_dim, q_head, kv_head, num_experts, active_experts, experts_dim, max_seq_len):
         super().__init__()
         embed_dim = head_dim * q_head
-        self.attn_norm = nn.RMSNorm(embed_dim)
+        self.attn_norm_weight = nn.Parameter(torch.ones(embed_dim))
         self.attn = Attention(head_dim, q_head, kv_head, max_seq_len)
         self.ffn_norm = nn.RMSNorm(embed_dim)
         self.ffn = FFN(embed_dim, num_experts, active_experts, experts_dim)
@@ -250,8 +250,9 @@ class TransformerBlock(nn.Module):
         kv_cache: Optional[KVCache] = None,
         metadata: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
-        # attn_norm + attention
-        attn_out = self.attn(self.attn_norm(x), layer_idx=layer_idx, kv_cache=kv_cache, metadata=metadata)
+        # attn_norm (fused Triton kernel) + attention
+        normed = invoke_rmsnorm(x, self.attn_norm_weight)
+        attn_out = self.attn(normed, layer_idx=layer_idx, kv_cache=kv_cache, metadata=metadata)
 
         # skip_rmsnorm: fused x+=attn_out + ffn_norm → 1 kernel (was 2)
         ffn_in = invoke_skip_rmsnorm(x, attn_out, self.ffn_norm.weight)
@@ -290,7 +291,7 @@ class Transformer(nn.Module):
             TransformerBlock(head_dim, q_head, kv_head, num_of_experts, active_experts, experts_dim, max_seq_len)
             for _ in range(num_of_layer)
         ])
-        self.final_norm = nn.RMSNorm(self.embed_dim)
+        self.final_norm_weight = nn.Parameter(torch.ones(self.embed_dim))
         # LM Head: project hidden states to vocab logits
         self.lm_head = nn.Linear(self.embed_dim, vocab_size, bias=False)
 
@@ -299,225 +300,73 @@ class Transformer(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
-        seq_lens: Optional[torch.Tensor] = None,
-        num_decode_seqs: int = 0,
+        metadata: Optional[AttentionMetadata] = None,
     ) -> torch.Tensor:
         """
-        Token-flat forward (vLLM V1 style).
+        Pure computation forward (vLLM V1 style).
         input_ids: [num_tokens], positions: [num_tokens],
-        kv_cache: multi-seq cache, seq_lens: [num_seqs].
-        num_decode_seqs: split index (decode first, prefill after).
+        kv_cache: multi-seq cache, metadata: scheduler-built.
         Returns: [num_tokens, vocab_size] logits.
-        """
-        # ── Scheduler pre-computes all attention metadata (zero per-layer cost) ──
-        metadata = self._build_metadata(positions, kv_cache, seq_lens, num_decode_seqs)
 
+        No scheduling logic. Scheduler handles metadata build + cache advance.
+        """
         h = self.token_embedding(input_ids, positions)
         for i, layer in enumerate(self.layers):
             h = layer(h, positions, layer_idx=i, kv_cache=kv_cache, metadata=metadata)
-        h = self.final_norm(h)
-        logits = self.lm_head(h)
-
-        # Advance cache after all layers processed
-        if kv_cache is not None and seq_lens is not None:
-            kv_cache.advance(seq_lens)
-
-        return logits
-
-    def _build_metadata(
-        self,
-        positions: torch.Tensor,
-        kv_cache: Optional[KVCache],
-        seq_lens: Optional[torch.Tensor],
-        num_decode_seqs: int,
-    ) -> Optional[AttentionMetadata]:
-        """Simulate scheduler: pre-compute ALL attention metadata on GPU once.
-
-        In production, this would be computed on CPU by the scheduler and
-        uploaded as part of the batch descriptor — zero GPU compute.
-        """
-        if kv_cache is None or seq_lens is None:
-            return None
-
-        device = positions.device
-        num_seqs = seq_lens.size(0)
-        num_tokens = positions.size(0)
-
-        # seq_ids: which sequence each token belongs to
-        seq_ids = torch.repeat_interleave(
-            torch.arange(num_seqs, device=device, dtype=torch.int64), seq_lens.long()
-        )
-
-        # cu_seqlens_q: cumulative Q token boundaries
-        cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
-        cu_seqlens_q[1:] = seq_lens.to(torch.int32).cumsum(0)
-
-        # ctx_lens: total KV length per seq after this forward
-        context_lens = kv_cache.context_lens[:num_seqs]
-        ctx_lens = context_lens + seq_lens.to(torch.int32)
-
-        # Scalars the FA wrapper needs (avoids D2H syncs at runtime)
-        num_decode_tokens = int(seq_lens[:num_decode_seqs].sum().item()) if num_decode_seqs > 0 else 0
-        max_kv_len = int(ctx_lens.max().item()) if num_seqs > 0 else 0
-
-        # Pre-rebased cu_seqlens for prefill subset (avoids elementwise subtraction)
-        num_prefill_seqs = num_seqs - num_decode_seqs
-        cu_seqlens_prefill = None
-        tile_seq_ids_prefill = None
-        if num_prefill_seqs > 0:
-            if num_decode_seqs > 0:
-                cu_seqlens_prefill = cu_seqlens_q[num_decode_seqs:] - cu_seqlens_q[num_decode_seqs]
-            else:
-                cu_seqlens_prefill = cu_seqlens_q  # no rebase needed
-            # Pre-compute tile_seq_ids for prefill FA (avoids arange+mul+searchsorted+cast at runtime)
-            total_prefill_tokens = num_tokens - num_decode_tokens
-            BLOCK_M = 128
-            import triton
-            num_tiles = triton.cdiv(total_prefill_tokens, BLOCK_M)
-            tile_seq_ids_prefill = torch.searchsorted(
-                cu_seqlens_prefill[1:],
-                torch.arange(num_tiles, device=device) * BLOCK_M,
-                right=True,
-            ).to(torch.int32)
-
-        return AttentionMetadata(
-            positions=positions,
-            seq_ids=seq_ids,
-            cu_seqlens_q=cu_seqlens_q,
-            ctx_lens=ctx_lens,
-            context_lens=context_lens,
-            num_decode_seqs=num_decode_seqs,
-            num_decode_tokens=num_decode_tokens,
-            max_kv_len=max_kv_len,
-            cu_seqlens_prefill=cu_seqlens_prefill,
-            tile_seq_ids_prefill=tile_seq_ids_prefill,
-        )
-
-    def create_kv_cache(self, num_seqs: int = 1, device: str = "cuda") -> KVCache:
-        """Create a fresh KV cache."""
-        return KVCache(
-            num_seqs=num_seqs,
-            num_layers=self.num_of_layer,
-            max_seq_len=self.max_seq_len,
-            kv_head=self.kv_head,
-            head_dim=self.head_dim,
-            dtype=next(self.parameters()).dtype,
-            device=device,
-        )
-
-    @torch.inference_mode()
-    def generate(
-        self,
-        prompt_ids: torch.Tensor,
-        max_new_tokens: int = 0,
-        temperature: float = 1.0,
-        top_k: int = 50,
-        top_p: float = 0.9,
-        eos_token_id: int = 2,
-    ) -> torch.Tensor:
-        """
-        Autoregressive generation with KV cache.
-
-        Args:
-            prompt_ids: [prompt_len] token IDs on device.
-            max_new_tokens: maximum number of tokens to generate.
-            temperature: sampling temperature (1.0 = no change, <1 sharper, >1 flatter).
-            top_k: keep only top-k logits before sampling.
-            top_p: nucleus sampling threshold.
-            eos_token_id: stop generation when this token is produced.
-
-        Returns:
-            [prompt_len + generated_len] full sequence of token IDs.
-        """
-        device = prompt_ids.device
-        kv_cache = self.create_kv_cache(num_seqs=1, device=device)
-
-        # If max_new_tokens=0, fill to max_seq_len
-        prompt_len = prompt_ids.size(0)
-        if max_new_tokens == 0:
-            max_new_tokens = self.max_seq_len - prompt_len
-        positions = torch.arange(prompt_len, device=device)
-        seq_lens = torch.tensor([prompt_len], device=device, dtype=torch.int32)
-        logits = self.forward(prompt_ids, positions, kv_cache, seq_lens)
-        next_token_logits = logits[-1]  # [vocab]
-
-        generated_ids = [prompt_ids]
-
-        # ── Phase 2: Decode loop ──
-        for _ in range(max_new_tokens):
-            # Sample next token
-            next_token = self._sample(next_token_logits, temperature, top_k, top_p)
-
-            generated_ids.append(next_token.unsqueeze(0))
-
-            # Stop on EOS
-            if next_token.item() == eos_token_id:
-                break
-
-            # Run single token through model with KV cache
-            pos = kv_cache.context_lens[0:1].long()
-            sl = torch.ones(1, device=device, dtype=torch.int32)
-            logits = self.forward(next_token.unsqueeze(0), pos, kv_cache, sl, num_decode_seqs=1)
-            next_token_logits = logits[0]  # [vocab]
-
-        return torch.cat(generated_ids, dim=0)
-
-    def _sample(
-        self,
-        logits: torch.Tensor,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-    ) -> torch.Tensor:
-        """Sample a single token from logits with temperature, top-k, and top-p."""
-        if temperature <= 0:
-            # Greedy
-            return logits.argmax(dim=-1)
-
-        logits = logits / temperature
-
-        # Top-k filtering
-        if top_k > 0:
-            top_k = min(top_k, logits.size(-1))
-            kth_val = logits.topk(top_k, dim=-1).values[..., -1]
-            logits = logits.where(logits >= kth_val, torch.full_like(logits, float('-inf')))
-
-        # Top-p (nucleus) filtering
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = logits.sort(descending=True, dim=-1)
-            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
-            # Remove tokens with cumulative prob > top_p
-            remove_mask = cumulative_probs > top_p
-            # Shift mask right so first token above threshold is kept
-            remove_mask[..., 1:] = remove_mask[..., :-1].clone()
-            remove_mask[..., 0] = False
-            sorted_logits[remove_mask] = float('-inf')
-            # Scatter back
-            logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
-
-        probs = logits.softmax(dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        h = invoke_rmsnorm(h, self.final_norm_weight)
+        return self.lm_head(h)
 
 
 if __name__ == "__main__":
+    from components import Scheduler
+
     model = Transformer(num_of_layer=1).half().cuda()
+    scheduler = Scheduler(model, max_batch_size=4)
 
     # Test 1: Generate (prefill + decode, fills to max_seq_len=128)
     prompt = torch.randint(0, 1000, [32]).cuda()
-    output = model.generate(prompt, temperature=0)
+    output = scheduler.generate(prompt, temperature=0)
     print(f"Generate: prompt=32, output={output.shape[0]} (generated {output.shape[0]-32})")
 
     # Test 2: Batched decode (4 seqs)
-    batch_kv = model.create_kv_cache(num_seqs=4)
+    scheduler.kv_cache.reset()
+    # Prefill each seq individually
     for i in range(4):
         plen = 16 + i * 8
         p = torch.randint(0, 1000, [plen]).cuda()
-        single_kv = model.create_kv_cache(num_seqs=1)
-        model.forward(p, torch.arange(plen).cuda(), single_kv, torch.tensor([plen]).cuda())
-        batch_kv.cache[i, :, :, :plen] = single_kv.cache[0, :, :, :plen]
-        batch_kv.context_lens[i] = plen
+        # Only use slot i: temporarily set other context_lens, then restore
+        scheduler.kv_cache.context_lens[i] = 0
+        positions = torch.arange(plen).cuda()
+        seq_lens = torch.tensor([plen], dtype=torch.int32).cuda()
+        # Build metadata for slot i only (single-seq prefill)
+        # Use a temporary single-slot view approach
+        from network import AttentionMetadata
+        import triton
+        cu = torch.tensor([0, plen], dtype=torch.int32, device='cuda')
+        ctx = torch.tensor([plen], dtype=torch.int32, device='cuda')
+        num_tiles = triton.cdiv(plen, 128)
+        tile_ids = torch.zeros(num_tiles, dtype=torch.int32, device='cuda')
+        meta = AttentionMetadata(
+            positions=positions,
+            seq_ids=torch.zeros(plen, dtype=torch.int64, device='cuda'),
+            cu_seqlens_q=cu,
+            ctx_lens=ctx,
+            context_lens=torch.zeros(1, dtype=torch.int32, device='cuda'),
+            num_decode_seqs=0, num_decode_tokens=0, max_kv_len=plen,
+            cu_seqlens_prefill=cu, tile_seq_ids_prefill=tile_ids,
+        )
+        # Use a single-seq cache view
+        k_view = scheduler.kv_cache.cache[i:i+1]
+        single_kv = KVCache.__new__(KVCache)
+        single_kv.cache = k_view
+        single_kv.context_lens = torch.zeros(1, dtype=torch.int32, device='cuda')
+        model.forward(p, positions, single_kv, meta)
+        scheduler.kv_cache.cache[i:i+1] = k_view
+        scheduler.kv_cache.context_lens[i] = plen
+
+    # Now batched decode step
     tokens = torch.randint(0, 1000, [4]).cuda()
-    positions = batch_kv.context_lens.long()
+    positions = scheduler.kv_cache.context_lens[:4].long()
     seq_lens = torch.ones(4, dtype=torch.int32).cuda()
-    logits = model.forward(tokens, positions, batch_kv, seq_lens, num_decode_seqs=4)
+    logits = scheduler.step(tokens, positions, seq_lens, num_decode_seqs=4)
     print(f"Batched decode: 4 seqs, logits={logits.shape}")
