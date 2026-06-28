@@ -113,22 +113,23 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(x)
 
         if kv_cache is not None:
-            # Cache views (pure view, zero kernel launch)
-            k_cache = kv_cache.cache[:num_seqs, layer_idx, 0]
-            v_cache = kv_cache.cache[:num_seqs, layer_idx, 1]
+            # Pool views per layer (zero-copy slice from pool)
+            k_pool = kv_cache.pool[:, layer_idx, 0]  # [max_slots, max_seq_len, kv_head, head_dim]
+            v_pool = kv_cache.pool[:, layer_idx, 1]
+            slot_mapping = kv_cache.slot_mapping       # [num_active] int32
 
-            # Op 2: attn_data_prep — all metadata pre-computed by scheduler
+            # Op 2: attn_data_prep — writes K/V to pool via slot_mapping
             q = invoke_attn_data_prep(
                 qkv, self.cos_cached, self.sin_cached,
                 metadata.positions, metadata.seq_ids,
                 self.q_norm.weight, self.k_norm.weight,
                 self.q_head, self.kv_head, self.head_dim,
-                k_cache, v_cache,
+                k_pool, v_pool, slot_mapping,
             )
 
-            # Op 3: flash_attention — all metadata pre-computed by scheduler
+            # Op 3: flash_attention — reads K/V from pool via slot_mapping
             out = invoke_flash_attention(
-                q, k_cache, v_cache,
+                q, k_pool, v_pool, slot_mapping,
                 metadata.cu_seqlens_q, metadata.ctx_lens,
                 num_decode_seqs=metadata.num_decode_seqs,
                 num_decode_tokens=metadata.num_decode_tokens,
@@ -318,55 +319,37 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-    from components import Scheduler
+    from components import PIDScheduler
 
     model = Transformer(num_of_layer=1).half().cuda()
-    scheduler = Scheduler(model, max_batch_size=4)
 
-    # Test 1: Generate (prefill + decode, fills to max_seq_len=128)
-    prompt = torch.randint(0, 1000, [32]).cuda()
-    output = scheduler.generate(prompt, temperature=0)
-    print(f"Generate: prompt=32, output={output.shape[0]} (generated {output.shape[0]-32})")
+    # Test 1: Single request generation
+    print("=" * 60)
+    print("Test 1: Single request")
+    scheduler = PIDScheduler(model, max_batch_size=8, target_ratio=0.8, temperature=0.0)
+    scheduler.add_request(torch.randint(0, 1000, [32]).cuda())
+    completed = scheduler.run_to_completion()
+    for req in completed:
+        total_len = req.prompt_ids.size(0) + len(req.generated_ids)
+        print(f"  Request {req.id}: prompt=32, total={total_len}, generated={len(req.generated_ids)}")
 
-    # Test 2: Batched decode (4 seqs)
-    scheduler.kv_cache.reset()
-    # Prefill each seq individually
+    # Test 2: Batch - 4 requests submitted together, PID admits smoothly
+    print("\n" + "=" * 60)
+    print("Test 2: Batch (4 requests, PID admission)")
+    scheduler = PIDScheduler(model, max_batch_size=8, target_ratio=0.8, temperature=0.0)
     for i in range(4):
-        plen = 16 + i * 8
-        p = torch.randint(0, 1000, [plen]).cuda()
-        # Only use slot i: temporarily set other context_lens, then restore
-        scheduler.kv_cache.context_lens[i] = 0
-        positions = torch.arange(plen).cuda()
-        seq_lens = torch.tensor([plen], dtype=torch.int32).cuda()
-        # Build metadata for slot i only (single-seq prefill)
-        # Use a temporary single-slot view approach
-        from network import AttentionMetadata
-        import triton
-        cu = torch.tensor([0, plen], dtype=torch.int32, device='cuda')
-        ctx = torch.tensor([plen], dtype=torch.int32, device='cuda')
-        num_tiles = triton.cdiv(plen, 128)
-        tile_ids = torch.zeros(num_tiles, dtype=torch.int32, device='cuda')
-        meta = AttentionMetadata(
-            positions=positions,
-            seq_ids=torch.zeros(plen, dtype=torch.int64, device='cuda'),
-            cu_seqlens_q=cu,
-            ctx_lens=ctx,
-            context_lens=torch.zeros(1, dtype=torch.int32, device='cuda'),
-            num_decode_seqs=0, num_decode_tokens=0, max_kv_len=plen,
-            cu_seqlens_prefill=cu, tile_seq_ids_prefill=tile_ids,
-        )
-        # Use a single-seq cache view
-        k_view = scheduler.kv_cache.cache[i:i+1]
-        single_kv = KVCache.__new__(KVCache)
-        single_kv.cache = k_view
-        single_kv.context_lens = torch.zeros(1, dtype=torch.int32, device='cuda')
-        model.forward(p, positions, single_kv, meta)
-        scheduler.kv_cache.cache[i:i+1] = k_view
-        scheduler.kv_cache.context_lens[i] = plen
+        scheduler.add_request(torch.randint(0, 1000, [16 + i * 8]).cuda())
+    completed = scheduler.run_to_completion()
+    for req in sorted(completed, key=lambda r: r.id):
+        total_len = req.prompt_ids.size(0) + len(req.generated_ids)
+        print(f"  Request {req.id}: prompt={req.prompt_ids.size(0)}, total={total_len}")
 
-    # Now batched decode step
-    tokens = torch.randint(0, 1000, [4]).cuda()
-    positions = scheduler.kv_cache.context_lens[:4].long()
-    seq_lens = torch.ones(4, dtype=torch.int32).cuda()
-    logits = scheduler.step(tokens, positions, seq_lens, num_decode_seqs=4)
-    print(f"Batched decode: 4 seqs, logits={logits.shape}")
+    # Test 3: Overload - 20 requests into 8-slot system, PID throttles
+    print("\n" + "=" * 60)
+    print("Test 3: Overload (20 requests, 8 slots, PID throttling)")
+    scheduler = PIDScheduler(model, max_batch_size=8, target_ratio=0.8, temperature=0.0)
+    for i in range(20):
+        scheduler.add_request(torch.randint(0, 1000, [16]).cuda())
+    completed = scheduler.run_to_completion()
+    print(f"  Completed: {len(completed)} requests")
+    print(f"  All done: {all(r.is_done for r in completed)}")

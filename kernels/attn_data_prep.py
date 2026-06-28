@@ -1,9 +1,8 @@
 """
-Kernel 1: Attention Data Preparation.
+Kernel 1: Attention Data Preparation (pool + slot_mapping version).
 
-Reads Q/K/V directly from the fused qkv GEMM output (non-contiguous views),
-applies RMSNorm + partial RoPE to Q and K, copies V straight through,
-and writes everything to contiguous seq-first output tensors.
+Reads Q/K/V from fused qkv GEMM output, applies RMSNorm + partial RoPE,
+writes Q to output tensor, K/V directly to pool via slot_mapping indirect addressing.
 """
 
 import torch
@@ -14,7 +13,8 @@ import triton.language as tl
 @triton.jit
 def _attn_data_prep_kernel(
     qkv_ptr,
-    q_out_ptr, k_cache_ptr, v_cache_ptr,
+    q_out_ptr, k_pool_ptr, v_pool_ptr,
+    slot_mapping_ptr,
     positions_ptr, seq_ids_ptr,
     gamma_q_ptr, gamma_k_ptr,
     cos_ptr, sin_ptr,
@@ -23,7 +23,7 @@ def _attn_data_prep_kernel(
     stride_qkv_seq,
     stride_cos_seq,
     stride_qo_seq, stride_qo_head,
-    stride_kc_seq, stride_kc_pos, stride_kc_head,
+    slot_stride, stride_kc_pos, stride_kc_head,
     Q_HEAD: tl.constexpr,
     KV_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -44,9 +44,12 @@ def _attn_data_prep_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     rp      = tl.arange(0, HALF_ROPE)
 
-    # Load position and seq_id for this token (kernel self-computes write address)
+    # Load position and seq_id for this token
     pos = tl.load(positions_ptr + pid_seq).to(tl.int64)
     seq_id = tl.load(seq_ids_ptr + pid_seq).to(tl.int64)
+
+    # Indirect addressing: load pool slot index from slot_mapping
+    slot_idx = tl.load(slot_mapping_ptr + seq_id).to(tl.int64)
 
     is_q = pid_h < Q_HEAD
     is_k = (not is_q) and (pid_h < Q_HEAD + KV_HEAD)
@@ -63,18 +66,17 @@ def _attn_data_prep_kernel(
     if is_q:
         dst = q_out_ptr + pid_seq * stride_qo_seq + pid_h * stride_qo_head
     elif is_k:
-        # Write directly to cache: kernel computes flat offset from seq_id + position
-        write_off = seq_id * stride_kc_seq + pos * stride_kc_pos
-        dst = k_cache_ptr + write_off + (pid_h - Q_HEAD) * stride_kc_head
+        # Write to pool: pool_ptr + slot * slot_stride + pos * pos_stride + head * head_stride
+        write_off = slot_idx * slot_stride + pos * stride_kc_pos
+        dst = k_pool_ptr + write_off + (pid_h - Q_HEAD) * stride_kc_head
     else:
-        write_off = seq_id * stride_kc_seq + pos * stride_kc_pos
-        dst = v_cache_ptr + write_off + (pid_h - Q_HEAD - KV_HEAD) * stride_kc_head
+        write_off = slot_idx * slot_stride + pos * stride_kc_pos
+        dst = v_pool_ptr + write_off + (pid_h - Q_HEAD - KV_HEAD) * stride_kc_head
 
     x_all = tl.load(src + offs_d).to(tl.float32)
 
     if is_q or is_k:
         gamma_ptr = gamma_q_ptr if is_q else gamma_k_ptr
-        # Index cos/sin by position (kernel does the lookup, no host pre-gather)
         cos_base  = cos_ptr + pos * stride_cos_seq
         sin_base  = sin_ptr + pos * stride_cos_seq
 
@@ -98,24 +100,21 @@ def _attn_data_prep_kernel(
 
 def invoke_attn_data_prep(
     qkv: torch.Tensor,
-    cos_cached: torch.Tensor,        # [max_seq_len, rope_dim] full RoPE buffer
-    sin_cached: torch.Tensor,        # [max_seq_len, rope_dim] full RoPE buffer
-    positions: torch.Tensor,         # [num_tokens] absolute position per token
-    seq_ids: torch.Tensor,           # [num_tokens] int64 - scheduler-precomputed seq ownership
+    cos_cached: torch.Tensor,        # [max_seq_len, rope_dim]
+    sin_cached: torch.Tensor,        # [max_seq_len, rope_dim]
+    positions: torch.Tensor,         # [num_tokens]
+    seq_ids: torch.Tensor,           # [num_tokens] int64
     gamma_q: torch.Tensor,
     gamma_k: torch.Tensor,
     q_head: int,
     kv_head: int,
     head_dim: int,
-    k_cache: torch.Tensor,           # [num_seqs, max_seq_len, kv_head, head_dim]
-    v_cache: torch.Tensor,           # same shape
+    k_pool: torch.Tensor,            # [max_slots, max_seq_len, kv_head, head_dim]
+    v_pool: torch.Tensor,            # same shape
+    slot_mapping: torch.Tensor,      # [num_seqs] int32
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Returns Q only. K/V are written directly to k_cache/v_cache.
-
-    Zero metadata computation: positions and seq_ids are pre-computed by scheduler.
-    Kernel uses them to index cos/sin and compute write offsets internally.
-    """
+    """Returns Q only. K/V written directly to pool via slot_mapping. Zero-copy."""
     seq_len = qkv.shape[0]
     qkv_dim = qkv.shape[1]
     dev, dt = qkv.device, qkv.dtype
@@ -131,14 +130,15 @@ def invoke_attn_data_prep(
 
     grid = (seq_len, q_head + 2 * kv_head)
     _attn_data_prep_kernel[grid](
-        qkv, q_out, k_cache, v_cache,
+        qkv, q_out, k_pool, v_pool,
+        slot_mapping,
         positions, seq_ids,
         gamma_q, gamma_k, cos_cached, sin_cached,
         seq_len, eps,
         stride_qkv_seq=qkv.stride(0),
         stride_cos_seq=cos_cached.stride(0),
         stride_qo_seq=q_out.stride(0), stride_qo_head=q_out.stride(1),
-        stride_kc_seq=k_cache.stride(0), stride_kc_pos=k_cache.stride(1), stride_kc_head=k_cache.stride(2),
+        slot_stride=k_pool.stride(0), stride_kc_pos=k_pool.stride(1), stride_kc_head=k_pool.stride(2),
         Q_HEAD=q_head,
         KV_HEAD=kv_head,
         HEAD_DIM=head_dim,

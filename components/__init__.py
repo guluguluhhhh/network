@@ -1,4 +1,5 @@
 from .kv_cache import KVCache
-from .scheduler import Scheduler
+from .pid_controller import PIDController
+from .scheduler import PIDScheduler
 
-__all__ = ["KVCache", "Scheduler"]
+__all__ = ["KVCache", "PIDController", "PIDScheduler"]

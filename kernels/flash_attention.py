@@ -17,12 +17,13 @@ import triton.language as tl
 
 @triton.jit
 def _flash_attn_prefill_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+    q_ptr, k_pool_ptr, v_pool_ptr, o_ptr,
+    slot_mapping_ptr,
     cu_seqlens_q_ptr, ctx_lens_ptr, tile_seq_ids_ptr,
     total_q_len,
     stride_q_seq, stride_q_head,
-    stride_kc_seq, stride_kc_pos, stride_kc_head,
-    stride_vc_seq, stride_vc_pos, stride_vc_head,
+    slot_stride, stride_kc_pos, stride_kc_head,
+    stride_vc_pos, stride_vc_head,
     stride_o_seq, stride_o_head,
     softmax_scale: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -55,8 +56,8 @@ def _flash_attn_prefill_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    k_base = k_cache_ptr + seq_idx * stride_kc_seq + kv_head_idx * stride_kc_head
-    v_base = v_cache_ptr + seq_idx * stride_vc_seq + kv_head_idx * stride_vc_head
+    k_base = k_pool_ptr + tl.load(slot_mapping_ptr + seq_idx).to(tl.int64) * slot_stride + kv_head_idx * stride_kc_head
+    v_base = v_pool_ptr + tl.load(slot_mapping_ptr + seq_idx).to(tl.int64) * slot_stride + kv_head_idx * stride_vc_head
 
     n_blocks = tl.cdiv(kv_seq_len, BLOCK_N)
     for n_start in range(0, n_blocks * BLOCK_N, BLOCK_N):
@@ -89,12 +90,13 @@ def _flash_attn_prefill_kernel(
 
 @triton.jit
 def _flash_decode_split_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr,
+    q_ptr, k_pool_ptr, v_pool_ptr,
     partial_o_ptr, partial_lse_ptr,
+    slot_mapping_ptr,
     ctx_lens_ptr,
     stride_q_batch, stride_q_head,
-    stride_kc_seq, stride_kc_pos, stride_kc_head,
-    stride_vc_seq, stride_vc_pos, stride_vc_head,
+    slot_stride, stride_kc_pos, stride_kc_head,
+    stride_vc_pos, stride_vc_head,
     stride_po_batch, stride_po_head, stride_po_split,
     stride_plse_batch, stride_plse_head,
     softmax_scale: tl.constexpr,
@@ -139,8 +141,8 @@ def _flash_decode_split_kernel(
     l_i = tl.zeros([1], dtype=tl.float32)
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
 
-    k_base = k_cache_ptr + batch_idx * stride_kc_seq + kv_head_idx * stride_kc_head
-    v_base = v_cache_ptr + batch_idx * stride_vc_seq + kv_head_idx * stride_vc_head
+    k_base = k_pool_ptr + tl.load(slot_mapping_ptr + batch_idx).to(tl.int64) * slot_stride + kv_head_idx * stride_kc_head
+    v_base = v_pool_ptr + tl.load(slot_mapping_ptr + batch_idx).to(tl.int64) * slot_stride + kv_head_idx * stride_vc_head
 
     local_len = kv_end - kv_start
     n_blocks = tl.cdiv(local_len, BLOCK_N)
@@ -229,27 +231,28 @@ def _flash_decode_reduce_kernel(
 # Python wrappers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_scale, tile_seq_ids):
-    """Prefill path: varlen kernel."""
+def _invoke_flash_prefill(q, k_pool, v_pool, slot_mapping, cu_seqlens_q, ctx_lens, softmax_scale, tile_seq_ids):
+    """Prefill path: varlen kernel with pool + slot_mapping."""
     total_q_len, q_head, head_dim = q.shape
-    kv_head = k_cache.shape[2]
+    kv_head = k_pool.shape[2]
     compute_dtype = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
     o = torch.empty(total_q_len, q_head, head_dim, dtype=q.dtype, device=q.device)
     BLOCK_M, BLOCK_N = 128, 128
     num_tiles = triton.cdiv(total_q_len, BLOCK_M)
 
-    # tile_seq_ids pre-computed by scheduler — zero runtime ops
+    # tile_seq_ids pre-computed by scheduler
     assert tile_seq_ids is not None and tile_seq_ids.shape[0] == num_tiles
 
     assert q.is_contiguous()
     _flash_attn_prefill_kernel[(num_tiles, q_head)](
-        q, k_cache, v_cache, o,
+        q, k_pool, v_pool, o,
+        slot_mapping,
         cu_seqlens_q, ctx_lens, tile_seq_ids,
         total_q_len,
         stride_q_seq=q.stride(0), stride_q_head=q.stride(1),
-        stride_kc_seq=k_cache.stride(0), stride_kc_pos=k_cache.stride(1), stride_kc_head=k_cache.stride(2),
-        stride_vc_seq=v_cache.stride(0), stride_vc_pos=v_cache.stride(1), stride_vc_head=v_cache.stride(2),
+        slot_stride=k_pool.stride(0), stride_kc_pos=k_pool.stride(1), stride_kc_head=k_pool.stride(2),
+        stride_vc_pos=v_pool.stride(1), stride_vc_head=v_pool.stride(2),
         stride_o_seq=o.stride(0), stride_o_head=o.stride(1),
         softmax_scale=softmax_scale,
         COMPUTE_DTYPE=compute_dtype,
@@ -259,10 +262,10 @@ def _invoke_flash_prefill(q, k_cache, v_cache, cu_seqlens_q, ctx_lens, softmax_s
     return o.reshape(total_q_len, q_head * head_dim)
 
 
-def _invoke_flash_decode(q, k_cache, v_cache, ctx_lens, softmax_scale, max_kv_len: int):
-    """Decode path: FlashDecoding with split-KV + reduce."""
+def _invoke_flash_decode(q, k_pool, v_pool, slot_mapping, ctx_lens, softmax_scale, max_kv_len: int):
+    """Decode path: FlashDecoding with pool + slot_mapping."""
     batch_size, q_head, head_dim = q.shape
-    kv_head = k_cache.shape[2]
+    kv_head = k_pool.shape[2]
     compute_dtype = tl.float16 if q.dtype == torch.float16 else tl.bfloat16
 
     # max_kv_len pre-computed by scheduler — zero D2H sync
@@ -278,12 +281,13 @@ def _invoke_flash_decode(q, k_cache, v_cache, ctx_lens, softmax_scale, max_kv_le
 
     # Phase 1: Split kernel
     _flash_decode_split_kernel[(q_head, batch_size, NUM_SPLITS)](
-        q, k_cache, v_cache,
+        q, k_pool, v_pool,
         partial_o, partial_lse,
+        slot_mapping,
         ctx_lens,
         stride_q_batch=q.stride(0), stride_q_head=q.stride(1),
-        stride_kc_seq=k_cache.stride(0), stride_kc_pos=k_cache.stride(1), stride_kc_head=k_cache.stride(2),
-        stride_vc_seq=v_cache.stride(0), stride_vc_pos=v_cache.stride(1), stride_vc_head=v_cache.stride(2),
+        slot_stride=k_pool.stride(0), stride_kc_pos=k_pool.stride(1), stride_kc_head=k_pool.stride(2),
+        stride_vc_pos=v_pool.stride(1), stride_vc_head=v_pool.stride(2),
         stride_po_batch=partial_o.stride(0), stride_po_head=partial_o.stride(1), stride_po_split=partial_o.stride(2),
         stride_plse_batch=partial_lse.stride(0), stride_plse_head=partial_lse.stride(1),
         softmax_scale=softmax_scale,
@@ -311,10 +315,11 @@ def _invoke_flash_decode(q, k_cache, v_cache, ctx_lens, softmax_scale, max_kv_le
 
 def invoke_flash_attention(
     q: torch.Tensor,            # [total_q, q_head, dim]
-    k_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
-    v_cache: torch.Tensor,      # [num_seqs, max_seq_len, kv_head, dim]
-    cu_seqlens_q: torch.Tensor, # [num_seqs+1] int32 - scheduler-precomputed
-    ctx_lens: torch.Tensor,     # [num_seqs] int32 - scheduler-precomputed
+    k_pool: torch.Tensor,       # [max_slots, max_seq_len, kv_head, dim]
+    v_pool: torch.Tensor,       # same shape
+    slot_mapping: torch.Tensor, # [num_seqs] int32 - maps batch idx to pool slot
+    cu_seqlens_q: torch.Tensor, # [num_seqs+1] int32
+    ctx_lens: torch.Tensor,     # [num_seqs] int32
     num_decode_seqs: int = 0,   # split index: seqs[:num_decode] are decode, seqs[num_decode:] are prefill
     num_decode_tokens: int = 0, # total decode Q tokens (avoids .item() D2H)
     max_kv_len: int = 0,        # max KV length (avoids .max().item() D2H)
@@ -342,24 +347,21 @@ def invoke_flash_attention(
     # Decode part: seqs [0, num_decode_seqs)
     if num_decode_seqs > 0:
         q_decode = q[:num_decode_tokens]
-        k_decode = k_cache[:num_decode_seqs]
-        v_decode = v_cache[:num_decode_seqs]
+        slot_mapping_decode = slot_mapping[:num_decode_seqs]
         ctx_decode = ctx_lens[:num_decode_seqs]
         out[:num_decode_tokens] = _invoke_flash_decode(
-            q_decode, k_decode, v_decode, ctx_decode, scale, max_kv_len
+            q_decode, k_pool, v_pool, slot_mapping_decode, ctx_decode, scale, max_kv_len
         )
 
     # Prefill part: seqs [num_decode_seqs, num_seqs)
     num_prefill_seqs = num_seqs - num_decode_seqs
     if num_prefill_seqs > 0:
         q_prefill = q[num_decode_tokens:]
-        k_prefill = k_cache[num_decode_seqs:num_seqs]
-        v_prefill = v_cache[num_decode_seqs:num_seqs]
+        slot_mapping_prefill = slot_mapping[num_decode_seqs:]
         ctx_prefill = ctx_lens[num_decode_seqs:num_seqs]
-        # Use pre-rebased cu_seqlens if available, otherwise cu_seqlens_q itself (offset=0)
         cu_prefill = cu_seqlens_prefill if cu_seqlens_prefill is not None else cu_seqlens_q
         out[num_decode_tokens:] = _invoke_flash_prefill(
-            q_prefill, k_prefill, v_prefill, cu_prefill, ctx_prefill, scale,
+            q_prefill, k_pool, v_pool, slot_mapping_prefill, cu_prefill, ctx_prefill, scale,
             tile_seq_ids_prefill,
         )
 
