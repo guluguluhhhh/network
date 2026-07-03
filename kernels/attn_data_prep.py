@@ -1,8 +1,10 @@
 """
-Kernel 1: Attention Data Preparation (pool + slot_mapping version).
+Kernel 1: Attention Data Preparation (paged KV cache version).
 
 Reads Q/K/V from fused qkv GEMM output, applies RMSNorm + partial RoPE,
-writes Q to output tensor, K/V directly to pool via slot_mapping indirect addressing.
+writes Q to output tensor, K/V directly to pool via block_tables paged addressing.
+
+Addressing: pool[block_tables[seq_id, pos // page_size], pos % page_size, head, dim]
 """
 
 import torch
@@ -14,7 +16,7 @@ import triton.language as tl
 def _attn_data_prep_kernel(
     qkv_ptr,
     q_out_ptr, k_pool_ptr, v_pool_ptr,
-    slot_mapping_ptr,
+    block_tables_ptr,
     positions_ptr, seq_ids_ptr,
     gamma_q_ptr, gamma_k_ptr,
     cos_ptr, sin_ptr,
@@ -23,7 +25,8 @@ def _attn_data_prep_kernel(
     stride_qkv_seq,
     stride_cos_seq,
     stride_qo_seq, stride_qo_head,
-    slot_stride, stride_kc_pos, stride_kc_head,
+    page_stride, stride_kc_pos, stride_kc_head,
+    max_blocks_per_seq,
     Q_HEAD: tl.constexpr,
     KV_HEAD: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -34,6 +37,7 @@ def _attn_data_prep_kernel(
     ROPE_DIM: tl.constexpr,
     ROPE_OFF: tl.constexpr,
     HALF_ROPE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
     pid_seq = tl.program_id(0)
@@ -48,8 +52,10 @@ def _attn_data_prep_kernel(
     pos = tl.load(positions_ptr + pid_seq).to(tl.int64)
     seq_id = tl.load(seq_ids_ptr + pid_seq).to(tl.int64)
 
-    # Indirect addressing: load pool slot index from slot_mapping
-    slot_idx = tl.load(slot_mapping_ptr + seq_id).to(tl.int64)
+    # Paged addressing: block_tables[seq_id, pos // page_size] -> physical page
+    page_idx = pos // PAGE_SIZE
+    in_page_pos = pos % PAGE_SIZE
+    physical_page = tl.load(block_tables_ptr + seq_id * max_blocks_per_seq + page_idx).to(tl.int64)
 
     is_q = pid_h < Q_HEAD
     is_k = (not is_q) and (pid_h < Q_HEAD + KV_HEAD)
@@ -66,11 +72,11 @@ def _attn_data_prep_kernel(
     if is_q:
         dst = q_out_ptr + pid_seq * stride_qo_seq + pid_h * stride_qo_head
     elif is_k:
-        # Write to pool: pool_ptr + slot * slot_stride + pos * pos_stride + head * head_stride
-        write_off = slot_idx * slot_stride + pos * stride_kc_pos
+        # Write to pool: pool[physical_page, in_page_pos, head]
+        write_off = physical_page * page_stride + in_page_pos * stride_kc_pos
         dst = k_pool_ptr + write_off + (pid_h - Q_HEAD) * stride_kc_head
     else:
-        write_off = slot_idx * slot_stride + pos * stride_kc_pos
+        write_off = physical_page * page_stride + in_page_pos * stride_kc_pos
         dst = v_pool_ptr + write_off + (pid_h - Q_HEAD - KV_HEAD) * stride_kc_head
 
     x_all = tl.load(src + offs_d).to(tl.float32)
@@ -109,12 +115,13 @@ def invoke_attn_data_prep(
     q_head: int,
     kv_head: int,
     head_dim: int,
-    k_pool: torch.Tensor,            # [max_slots, max_seq_len, kv_head, head_dim]
+    k_pool: torch.Tensor,            # [num_pages, page_size, kv_head, head_dim]
     v_pool: torch.Tensor,            # same shape
-    slot_mapping: torch.Tensor,      # [num_seqs] int32
+    block_tables: torch.Tensor,      # [num_seqs, max_blocks_per_seq] int32
+    page_size: int = 128,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Returns Q only. K/V written directly to pool via slot_mapping. Zero-copy."""
+    """Returns Q only. K/V written directly to pool via block_tables paged addressing."""
     seq_len = qkv.shape[0]
     qkv_dim = qkv.shape[1]
     dev, dt = qkv.device, qkv.dtype
@@ -122,6 +129,7 @@ def invoke_attn_data_prep(
     half_rope = rope_dim // 2
     rope_off  = head_dim - rope_dim
     compute_dt = tl.float16 if dt == torch.float16 else tl.bfloat16
+    max_blocks_per_seq = block_tables.shape[1]
 
     q_out = torch.empty(seq_len, q_head, head_dim, dtype=dt, device=dev)
 
@@ -131,14 +139,15 @@ def invoke_attn_data_prep(
     grid = (seq_len, q_head + 2 * kv_head)
     _attn_data_prep_kernel[grid](
         qkv, q_out, k_pool, v_pool,
-        slot_mapping,
+        block_tables,
         positions, seq_ids,
         gamma_q, gamma_k, cos_cached, sin_cached,
         seq_len, eps,
         stride_qkv_seq=qkv.stride(0),
         stride_cos_seq=cos_cached.stride(0),
         stride_qo_seq=q_out.stride(0), stride_qo_head=q_out.stride(1),
-        slot_stride=k_pool.stride(0), stride_kc_pos=k_pool.stride(1), stride_kc_head=k_pool.stride(2),
+        page_stride=k_pool.stride(0), stride_kc_pos=k_pool.stride(1), stride_kc_head=k_pool.stride(2),
+        max_blocks_per_seq=max_blocks_per_seq,
         Q_HEAD=q_head,
         KV_HEAD=kv_head,
         HEAD_DIM=head_dim,
@@ -149,6 +158,7 @@ def invoke_attn_data_prep(
         ROPE_DIM=rope_dim,
         ROPE_OFF=rope_off,
         HALF_ROPE=half_rope,
+        PAGE_SIZE=page_size,
         COMPUTE_DTYPE=compute_dt,
     )
     return q_out

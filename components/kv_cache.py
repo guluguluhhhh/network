@@ -1,109 +1,155 @@
 """
-Pool-based KV Cache with slot_mapping indirect addressing.
+Paged KV Cache with block_tables indirect addressing (FlashInfer-compatible).
 
-Physical layout: one pre-allocated pool tensor [max_slots, layers, 2, max_seq_len, kv_head, head_dim]
-Logical management: PID scheduler controls which slots are in use.
-Kernel access: pool_ptr + slot_mapping[batch_idx] * slot_stride + pos * pos_stride + head * head_stride
+Physical layout: one pre-allocated pool tensor [num_pages, num_layers, 2, page_size, kv_head, head_dim]
+Logical management: block_tables[seq_id, logical_page_idx] -> physical_page_id
+Kernel access: pool[block_tables[seq, pos // page_size], layer, kv, pos % page_size, head, :]
 
-Zero-copy per step: prepare_batch only constructs a small slot_mapping tensor (~N int32s).
-No torch.stack, no writeback. Kernel reads/writes pool directly.
+FlashInfer compatibility:
+  - Per-layer slice: pool[:, layer_idx] -> [num_pages, 2, page_size, kv_head, head_dim] (NHD layout)
+  - block_tables: [batch_size, max_blocks_per_seq] int32
+  - last_page_len: [batch_size] int32
+
+Zero-copy per step: prepare_batch only constructs small index tensors.
 """
 
+import math
 import torch
 
 
+PAGE_SIZE = 128  # = BLOCK_N, aligned with kernel tile size
+
+
+class PageOOMError(RuntimeError):
+    """Raised when the page pool is exhausted."""
+    pass
+
+
 class KVCache:
-    """Pool-based KV Cache with slot_mapping for indirect addressing."""
+    """Paged KV Cache with block_tables for indirect addressing (FlashInfer-compatible)."""
 
     def __init__(self, num_layers: int, max_seq_len: int, kv_head: int, head_dim: int,
                  dtype: torch.dtype = torch.float16, device: str = "cuda",
-                 max_slots: int = 16384):
+                 num_pages: int = 4096, page_size: int = PAGE_SIZE):
         self.num_layers = num_layers
         self.max_seq_len = max_seq_len
         self.kv_head = kv_head
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
-        self.max_slots = max_slots
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.max_blocks_per_seq = math.ceil(max_seq_len / page_size)
 
         # Pool: one-time allocation (physical memory limit)
-        # Shape: [max_slots, num_layers, 2(K/V), max_seq_len, kv_head, head_dim]
+        # Shape: [num_pages, num_layers, 2(K/V), page_size, kv_head, head_dim]
         self.pool = torch.zeros(
-            max_slots, num_layers, 2, max_seq_len, kv_head, head_dim,
+            num_pages, num_layers, 2, page_size, kv_head, head_dim,
             dtype=dtype, device=device,
         )
 
-        # Slot management
-        self.free_slots: set = set(range(max_slots))
-        self.used_slots: dict[int, int] = {}  # slot_id -> context_len
+        # Page management
+        self.free_pages: set = set(range(num_pages))
+        self.seq_page_table: dict[int, list[int]] = {}  # seq_id -> [phys_page_0, phys_page_1, ...]
+        self.seq_lens: dict[int, int] = {}  # seq_id -> total KV length (context + new tokens)
 
         # Batch view (rebuilt each step by prepare_batch)
-        self.slot_mapping: torch.Tensor | None = None  # [num_active] int32
-        self.context_lens: torch.Tensor | None = None  # [num_active] int32
-        self._batch_slot_ids: list[int] = []
+        self.block_tables: torch.Tensor | None = None   # [batch_size, max_blocks_per_seq] int32
+        self.batch_seq_lens: torch.Tensor | None = None  # [batch_size] int32
+        self.last_page_len: torch.Tensor | None = None   # [batch_size] int32
+        self._batch_seq_ids: list[int] = []
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # Slot lifecycle
-    # ═══════════════════════════════════════════════════════════════════════
+    # ===================================================================
+    # Page lifecycle
+    # ===================================================================
 
-    def allocate(self) -> int:
-        """Allocate a slot from the pool. Called when PID admits a request."""
-        slot = self.free_slots.pop()
-        self.used_slots[slot] = 0
-        return slot
+    def allocate_pages(self, seq_id: int, num_new: int):
+        """Allocate pages for a seq. Called on prefill or when last page is full."""
+        if num_new > len(self.free_pages):
+            raise PageOOMError(
+                f"Need {num_new} pages but only {len(self.free_pages)} free")
+        if seq_id not in self.seq_page_table:
+            self.seq_page_table[seq_id] = []
+            self.seq_lens[seq_id] = 0
+        for _ in range(num_new):
+            page = self.free_pages.pop()
+            self.seq_page_table[seq_id].append(page)
 
-    def release(self, slot_id: int):
-        """Release a slot back to pool. Called on EOS."""
-        if slot_id in self.used_slots:
-            del self.used_slots[slot_id]
-            self.free_slots.add(slot_id)
-
-    @property
-    def num_active(self) -> int:
-        return len(self.used_slots)
+    def release(self, seq_id: int):
+        """Release all pages for a seq. Called on EOS."""
+        if seq_id in self.seq_page_table:
+            for page in self.seq_page_table[seq_id]:
+                self.free_pages.add(page)
+            del self.seq_page_table[seq_id]
+            del self.seq_lens[seq_id]
 
     @property
     def num_free(self) -> int:
-        return len(self.free_slots)
+        return len(self.free_pages)
 
     @property
     def total_kv_tokens(self) -> int:
-        """Total KV tokens in use. PID's process variable."""
-        return sum(self.used_slots.values())
+        """Total KV tokens in use across all seqs."""
+        return sum(self.seq_lens.values())
 
-    # ═══════════════════════════════════════════════════════════════════════
+    # ===================================================================
     # Batch preparation (called once per step, zero-copy)
-    # ═══════════════════════════════════════════════════════════════════════
+    # ===================================================================
 
-    def prepare_batch(self, batch_slot_ids: list[int]):
-        """Construct slot_mapping + context_lens tensors for kernel.
+    def prepare_batch(self, batch_seq_ids: list[int]):
+        """Construct block_tables + seq_lens + last_page_len tensors for kernel.
 
-        This is the ONLY per-step operation. No data copy — just build
-        two small index tensors. Kernel uses slot_mapping to index into pool.
+        Output tensors are FlashInfer-compatible:
+          block_tables:  [batch_size, max_blocks_per_seq] int32
+          batch_seq_lens: [batch_size] int32
+          last_page_len: [batch_size] int32
         """
-        self._batch_slot_ids = batch_slot_ids
-        if not batch_slot_ids:
-            self.slot_mapping = None
-            self.context_lens = None
+        self._batch_seq_ids = batch_seq_ids
+        if not batch_seq_ids:
+            self.block_tables = None
+            self.batch_seq_lens = None
+            self.last_page_len = None
             return
 
-        self.slot_mapping = torch.tensor(
-            batch_slot_ids, dtype=torch.int32, device=self.device
-        )
-        self.context_lens = torch.tensor(
-            [self.used_slots[s] for s in batch_slot_ids],
-            dtype=torch.int32, device=self.device,
-        )
+        batch_size = len(batch_seq_ids)
+        # Build block_tables (pad with 0 for unused entries)
+        bt = torch.zeros(batch_size, self.max_blocks_per_seq, dtype=torch.int32, device=self.device)
+        sl = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+        lpl = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
 
-    def advance(self, seq_lens: torch.Tensor):
-        """Advance context_lens for current batch after forward."""
-        for i, sid in enumerate(self._batch_slot_ids):
-            self.used_slots[sid] += int(seq_lens[i].item())
+        for i, seq_id in enumerate(batch_seq_ids):
+            pages = self.seq_page_table[seq_id]
+            seq_len = self.seq_lens[seq_id]
+            for j, page_id in enumerate(pages):
+                bt[i, j] = page_id
+            sl[i] = seq_len
+            # last_page_len: how many tokens are valid in the last page
+            if seq_len > 0:
+                lpl[i] = ((seq_len - 1) % self.page_size) + 1
+            else:
+                lpl[i] = 0
+
+        self.block_tables = bt
+        self.batch_seq_lens = sl
+        self.last_page_len = lpl
+
+    def advance(self, seq_ids: list[int], token_counts: list[int]):
+        """Advance seq_lens after forward. Allocate new page if needed."""
+        for seq_id, count in zip(seq_ids, token_counts):
+            new_len = self.seq_lens[seq_id] + count
+            self.seq_lens[seq_id] = new_len
+            # Allocate more pages only if current allocation is insufficient
+            pages_needed = math.ceil(new_len / self.page_size) if new_len > 0 else 0
+            pages_have = len(self.seq_page_table[seq_id])
+            if pages_needed > pages_have:
+                self.allocate_pages(seq_id, pages_needed - pages_have)
 
     def reset(self):
-        """Release all slots."""
-        self.free_slots = set(range(self.max_slots))
-        self.used_slots.clear()
-        self.slot_mapping = None
-        self.context_lens = None
-        self._batch_slot_ids = []
+        """Release all pages."""
+        self.free_pages = set(range(self.num_pages))
+        self.seq_page_table.clear()
+        self.seq_lens.clear()
+        self.block_tables = None
+        self.batch_seq_lens = None
+        self.last_page_len = None
+        self._batch_seq_ids = []

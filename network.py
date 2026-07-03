@@ -113,29 +113,33 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(x)
 
         if kv_cache is not None:
-            # Pool views per layer (zero-copy slice from pool)
-            k_pool = kv_cache.pool[:, layer_idx, 0]  # [max_slots, max_seq_len, kv_head, head_dim]
-            v_pool = kv_cache.pool[:, layer_idx, 1]
-            slot_mapping = kv_cache.slot_mapping       # [num_active] int32
+            # Per-layer paged KV cache view (FlashInfer-compatible 5D tensor)
+            # pool[:, layer_idx] -> [num_pages, 2, page_size, kv_head, head_dim]
+            paged_kv = kv_cache.pool[:, layer_idx]  # [num_pages, 2, page_size, kv_head, head_dim]
+            k_pool = paged_kv[:, 0]  # [num_pages, page_size, kv_head, head_dim]
+            v_pool = paged_kv[:, 1]  # [num_pages, page_size, kv_head, head_dim]
+            block_tables = kv_cache.block_tables  # [batch_size, max_blocks_per_seq] int32
 
-            # Op 2: attn_data_prep — writes K/V to pool via slot_mapping
+            # Op 2: attn_data_prep — writes K/V to pool via block_tables
             q = invoke_attn_data_prep(
                 qkv, self.cos_cached, self.sin_cached,
                 metadata.positions, metadata.seq_ids,
                 self.q_norm.weight, self.k_norm.weight,
                 self.q_head, self.kv_head, self.head_dim,
-                k_pool, v_pool, slot_mapping,
+                k_pool, v_pool, block_tables,
+                page_size=kv_cache.page_size,
             )
 
-            # Op 3: flash_attention — reads K/V from pool via slot_mapping
+            # Op 3: flash_attention — reads K/V from pool via block_tables
             out = invoke_flash_attention(
-                q, k_pool, v_pool, slot_mapping,
+                q, k_pool, v_pool, block_tables,
                 metadata.cu_seqlens_q, metadata.ctx_lens,
                 num_decode_seqs=metadata.num_decode_seqs,
                 num_decode_tokens=metadata.num_decode_tokens,
                 max_kv_len=metadata.max_kv_len,
                 cu_seqlens_prefill=metadata.cu_seqlens_prefill,
                 tile_seq_ids_prefill=metadata.tile_seq_ids_prefill,
+                page_size=kv_cache.page_size,
             )
 
         # Op 4: O projection GEMM

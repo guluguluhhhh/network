@@ -1,9 +1,13 @@
+# -*- coding: utf-8 -*-
 """
-PID Scheduler Benchmark: Real model inference with pool+slot_mapping KV cache.
+PID Scheduler Benchmark with Paged KV Cache.
 
-Client: Poisson-distributed request arrivals with load phases.
-Server: Real PIDScheduler + Transformer (actual GPU forward pass each step).
-Output: PNG plot showing KV cache utilization and request latency.
+Realistic workload:
+  - Prompt lengths: LogNormal (median ~50, range [16, 300])
+  - Generation lengths: LogNormal HIGH VARIANCE (median ~50, long tail to 450)
+  - Arrival: Poisson base + periodic 10x burst spikes
+
+Shows PID controlling active_seqs under unpredictable exit rates.
 """
 
 import sys
@@ -19,150 +23,185 @@ from network import Transformer
 from components import PIDScheduler
 
 
+# ==============================================================================
+# Workload
+# ==============================================================================
+
 def get_arrival_rate(step: int) -> float:
-    if step < 200:
-        return 30.0
-    elif step < 600:
-        return 80.0
+    """Poisson base + burst spikes every 150 steps."""
+    if step < 100:
+        base = 5.0   # warm-up
     else:
-        return 35.0
+        base = 12.0  # sustained high load
+    # Burst: 10x for 5 steps, every 150 steps during high-load
+    if step >= 100 and (step % 150) < 5:
+        return base * 10.0
+    return base
 
 
-def sample_prompt_len() -> int:
-    return int(np.clip(np.random.normal(32, 8), 16, 64))
+def generate_workload(num_steps: int, seed: int = 42):
+    """Pre-generate: list of [(prompt_len, gen_len), ...] per step."""
+    rng = np.random.RandomState(seed)
+    workload = []
+    for step in range(num_steps):
+        rate = get_arrival_rate(step)
+        num_arrivals = rng.poisson(rate)
+        requests = []
+        for _ in range(num_arrivals):
+            plen = int(np.clip(rng.lognormal(4.0, 0.6), 16, 300))
+            glen = int(np.clip(rng.lognormal(3.9, 1.0), 5, 450))
+            requests.append((plen, glen))
+        workload.append(requests)
+    return workload
 
+
+# ==============================================================================
+# Benchmark
+# ==============================================================================
 
 @torch.inference_mode()
-def run_benchmark(num_steps=1000):
-    print("Initializing model + PID scheduler...")
-    model = Transformer(num_of_layer=1, max_seq_len=128).half().cuda()
-    # pool = 4000 slots * 64KB/slot = 256MB, target_active = 0.8*4000 = 3200
+def run_single(workload, admit_mode="pid", num_steps=1000, label=""):
+    """Run benchmark with given admit_mode. Returns metrics dict."""
+    MAX_SEQ_LEN = 512
+    NUM_PAGES = 2048
+    MAX_BATCH = 512
+
+    print(f"\n{'='*60}")
+    print(f"  Mode: {admit_mode.upper()} {label}")
+    print(f"{'='*60}")
+
+    model = Transformer(num_of_layer=1, max_seq_len=MAX_SEQ_LEN).half().cuda()
     scheduler = PIDScheduler(
         model,
-        max_batch_size=4000,
+        max_batch_size=MAX_BATCH,
         target_ratio=0.8,
-        kp=0.5, ki=0.01, kd=0.3,
+        kp=0.15, ki=0.005, kd=0.1,
         temperature=0.0,
+        admit_mode=admit_mode,
+        num_pages=NUM_PAGES,
     )
 
-    max_total_tokens = scheduler.max_total_tokens
-    target_active = scheduler.pid.setpoint
-    print(f"  max_slots={scheduler.kv_cache.max_slots}, target_active={target_active:.0f} seqs")
-    print(f"  max_total_tokens={max_total_tokens}")
+    target_pages = scheduler.pid.setpoint
+    print(f"  num_pages={NUM_PAGES}, page_size={scheduler.kv_cache.page_size}, "
+          f"target_pages={target_pages:.0f} ({target_pages/NUM_PAGES*100:.0f}%)")
 
     # Metrics
-    steps = []
-    kv_usage = []
-    active_counts = []
-    queue_lens = []
-    arrival_rates = []
-
-    submit_times = {}
-    latencies = []
-
-    np.random.seed(42)
+    steps, kv_usage, active_counts, queue_lens, pages_used = [], [], [], [], []
     total_submitted = 0
     total_completed = 0
 
-    print(f"\nRunning {num_steps} steps...")
+    print(f"  Running {num_steps} steps...")
     for step in range(num_steps):
-        # Client: inject requests
-        rate = get_arrival_rate(step)
-        num_arrivals = np.random.poisson(rate)
-        for _ in range(num_arrivals):
-            prompt_len = sample_prompt_len()
+        for (prompt_len, gen_len) in workload[step]:
             prompt = torch.randint(0, 1000, [prompt_len], device='cuda')
-            req_id = scheduler.add_request(prompt)
-            submit_times[req_id] = step
+            scheduler.add_request(prompt, max_gen_tokens=gen_len)
             total_submitted += 1
 
-        # Server: one real forward step
         completed = scheduler.step()
+        total_completed += len(completed)
 
-        for req in completed:
-            submit_step = submit_times.pop(req.id, step)
-            latencies.append((step, step - submit_step, req.prompt_ids.size(0)))
-            total_completed += 1
-
-        # Metrics
-        kv_used = scheduler.kv_cache.total_kv_tokens
         steps.append(step)
-        kv_usage.append(kv_used)
-        active_counts.append(len(scheduler.active_pool))
-        queue_lens.append(len(scheduler.waiting_queue))
-        arrival_rates.append(rate)
-
-        if (step + 1) % 100 == 0:
-            print(f"  Step {step+1}: KV={kv_used}, active={len(scheduler.active_pool)}, "
-                  f"queue={len(scheduler.waiting_queue)}, completed={total_completed}")
-
-    # Drain
-    drain_steps = 0
-    while scheduler.has_work() and drain_steps < 300:
-        completed = scheduler.step()
-        for req in completed:
-            submit_step = submit_times.pop(req.id, num_steps + drain_steps)
-            latencies.append((num_steps + drain_steps, (num_steps + drain_steps) - submit_step, req.prompt_ids.size(0)))
-            total_completed += 1
-        steps.append(num_steps + drain_steps)
         kv_usage.append(scheduler.kv_cache.total_kv_tokens)
         active_counts.append(len(scheduler.active_pool))
         queue_lens.append(len(scheduler.waiting_queue))
-        arrival_rates.append(0.0)
-        drain_steps += 1
+        pages_used.append(NUM_PAGES - scheduler.kv_cache.num_free)
 
-    print(f"\nDone: submitted={total_submitted}, completed={total_completed}, drain={drain_steps}")
-    if latencies:
-        lats = [l[1] for l in latencies]
-        print(f"Latency: mean={np.mean(lats):.1f}, p50={np.median(lats):.1f}, p99={np.percentile(lats, 99):.1f}")
+        if (step + 1) % 200 == 0:
+            print(f"  Step {step+1}: active={len(scheduler.active_pool)}, "
+                  f"KV={scheduler.kv_cache.total_kv_tokens}, "
+                  f"pages={NUM_PAGES - scheduler.kv_cache.num_free}/{NUM_PAGES}, "
+                  f"queue={len(scheduler.waiting_queue)}")
 
-    return steps, kv_usage, active_counts, queue_lens, arrival_rates, latencies, target_active, max_total_tokens
+    print(f"  Done: submitted={total_submitted}, completed={total_completed}")
+
+    # Cleanup GPU memory for next run
+    del scheduler, model
+    torch.cuda.empty_cache()
+
+    return dict(steps=steps, kv_usage=kv_usage, active_counts=active_counts,
+                queue_lens=queue_lens, pages_used=pages_used,
+                target_pages=target_pages, num_pages=NUM_PAGES)
 
 
-def plot_results(steps, kv_usage, active_counts, queue_lens, arrival_rates,
-                 latencies, target_active, max_total_tokens):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9), sharex=False)
-    fig.suptitle("PID Continuous Batching Scheduler (pool+slot_mapping)", fontsize=13)
+def run_benchmark(num_steps=1000):
+    """Run both PID and No-PID on identical workload, return comparison."""
+    print("Generating workload...")
+    workload = generate_workload(num_steps)
+    total_reqs = sum(len(w) for w in workload)
+    gen_lens = [g for step in workload for (_, g) in step]
+    print(f"  Requests: {total_reqs}, gen_len median={np.median(gen_lens):.0f}, "
+          f"mean={np.mean(gen_lens):.0f}, p99={np.percentile(gen_lens, 99):.0f}")
 
-    # Top: active seqs + KV
-    ax1.plot(steps, active_counts, 'b-', linewidth=1, label='Active seqs')
-    ax1.axhline(y=target_active, color='r', linestyle='--', linewidth=1.5,
-                label=f'PID target ({target_active:.0f} seqs)')
-    ax1.set_ylabel('Active Sequences', color='b')
-    ax1.set_xlabel('Step')
-    ax1.legend(loc='upper left', fontsize=9)
+    pid_results = run_single(workload, admit_mode="pid", num_steps=num_steps,
+                             label="(controlled)")
+    nopid_results = run_single(workload, admit_mode="nopid", num_steps=num_steps,
+                               label="(all-admit)")
+    return pid_results, nopid_results
+
+
+# ==============================================================================
+# Plot (PID vs No-PID comparison)
+# ==============================================================================
+
+def plot_results(pid, nopid):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+    fig.suptitle("PID vs No-PID Scheduler Comparison\n"
+                 "(identical workload: LogNormal prompt/gen, burst arrivals)",
+                 fontsize=13, fontweight='bold')
+
+    target_pages = pid['target_pages']
+    num_pages = pid['num_pages']
+
+    # -- Top: Active Sequences --
+    ax1.plot(pid['steps'], pid['active_counts'], 'b-', linewidth=1.0,
+             label='PID (active)', alpha=0.9)
+    ax1.plot(nopid['steps'], nopid['active_counts'], 'r-', linewidth=1.0,
+             label='No-PID (active)', alpha=0.7)
+    ax1.set_ylabel('Active Sequences')
+    ax1.legend(loc='upper right', fontsize=9)
     ax1.grid(True, alpha=0.3)
-    ax1.set_title('Active Sequences (PID-controlled) & Queue Length')
+    ax1.set_title('Active Sequences')
+    for s in range(100, 1000, 150):
+        ax1.axvspan(s, s + 5, alpha=0.06, color='purple')
 
-    ax1.axvspan(0, 200, alpha=0.05, color='blue')
-    ax1.axvspan(200, 600, alpha=0.05, color='red')
-    ax1.axvspan(600, 1000, alpha=0.05, color='green')
-
-    ax1b = ax1.twinx()
-    ax1b.plot(steps, queue_lens, 'orange', linewidth=0.8, alpha=0.7, label='Queue')
-    ax1b.set_ylabel('Queue Length', color='orange')
-
-    # Bottom: latency
-    if latencies:
-        cs = [l[0] for l in latencies]
-        ls = [l[1] for l in latencies]
-        colors = ['blue' if s < 200 else 'red' if s < 600 else 'green' for s in cs]
-        ax2.scatter(cs, ls, c=colors, s=6, alpha=0.5)
-        ax2.axhline(y=np.mean(ls), color='black', linestyle='--', linewidth=1,
-                    label=f'Mean={np.mean(ls):.0f}')
-        ax2.set_xlabel('Completion Step')
-        ax2.set_ylabel('Latency (steps)')
-        ax2.set_title('Per-Request Latency')
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.3)
+    # -- Bottom: Pages Used (KV pressure) --
+    ax2.plot(pid['steps'], pid['pages_used'], 'b-', linewidth=1.0,
+             label='PID (pages)', alpha=0.9)
+    ax2.plot(nopid['steps'], nopid['pages_used'], 'r-', linewidth=1.0,
+             label='No-PID (pages)', alpha=0.7)
+    ax2.axhline(y=num_pages, color='gray', linestyle=':', linewidth=1,
+                label=f'Capacity ({num_pages})')
+    ax2.axhline(y=target_pages, color='green', linestyle='--', linewidth=1.5,
+                label=f'PID target ({int(target_pages)}, {target_pages/num_pages*100:.0f}%)')
+    ax2.set_ylabel('Pages Used')
+    ax2.set_xlabel('Step')
+    ax2.legend(loc='upper right', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_title('KV Page Usage: PID controls towards 80% target')
+    for s in range(100, 1000, 150):
+        ax2.axvspan(s, s + 5, alpha=0.06, color='purple')
 
     plt.tight_layout()
-    out_path = os.path.join(os.path.dirname(__file__), "pid_bench_results.png")
+    out_path = os.path.join(os.path.dirname(__file__), "pid_vs_nopid_bench.png")
     plt.savefig(out_path, dpi=150)
     print(f"\nPlot saved: {out_path}")
     plt.close()
 
+    # Print summary comparison
+    print("\n" + "="*60)
+    print("  COMPARISON SUMMARY")
+    print("="*60)
+    print(f"  {'Metric':<25} {'PID':>12} {'No-PID':>12} {'Diff':>10}")
+    print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*10}")
+    pa = np.max(pid['pages_used'])
+    na = np.max(nopid['pages_used'])
+    print(f"  {'Peak pages used':<25} {pa:>12} {na:>12} {na-pa:>+10}")
+    pa2 = np.mean(pid['active_counts'])
+    na2 = np.mean(nopid['active_counts'])
+    print(f"  {'Mean active seqs':<25} {pa2:>12.1f} {na2:>12.1f} {na2-pa2:>+10.1f}")
+    print("="*60)
+
 
 if __name__ == "__main__":
-    results = run_benchmark(num_steps=1000)
-    plot_results(*results)
+    pid_results, nopid_results = run_benchmark(num_steps=1000)
+    plot_results(pid_results, nopid_results)

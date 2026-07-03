@@ -21,7 +21,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-from components.kv_cache import KVCache
+from components.kv_cache import KVCache, PageOOMError
 from components.pid_controller import PIDController
 
 
@@ -40,6 +40,7 @@ class Request:
     is_prefilled: bool = False
     is_done: bool = False
     slot_id: int = -1              # assigned KV cache slot
+    max_gen_tokens: int = -1       # per-request generation cap (-1 = use max_seq_len)
 
 
 class PIDScheduler:
@@ -59,15 +60,17 @@ class PIDScheduler:
         kd: float = 0.1,
         eos_token_id: int = 2,
         temperature: float = 0.0,
+        admit_mode: str = "pid",  # "pid" | "threshold" | "nopid"
+        num_pages: int = 4096,
     ):
         self.model = model
         self.max_batch_size = max_batch_size
-        self.max_total_tokens = max_batch_size * model.max_seq_len
         self.eos_token_id = eos_token_id
         self.temperature = temperature
         self.device = next(model.parameters()).device
 
-        # KV Cache — pool-based, zero-copy
+        # KV Cache — paged, FlashInfer-compatible
+        from components.kv_cache import PAGE_SIZE
         self.kv_cache = KVCache(
             num_layers=model.num_of_layer,
             max_seq_len=model.max_seq_len,
@@ -75,31 +78,36 @@ class PIDScheduler:
             head_dim=model.head_dim,
             dtype=next(model.parameters()).dtype,
             device=self.device,
-            max_slots=max_batch_size,
+            num_pages=num_pages,
+            page_size=PAGE_SIZE,
         )
+        self.max_total_tokens = num_pages * PAGE_SIZE
 
-        # PID Controller — controls active_seqs count
-        # SP = target_active = target_ratio * max_slots (direct: 80% of pool capacity)
-        target_active = target_ratio * max_batch_size
+        # PID Controller — controls page utilization towards target_ratio
+        target_pages = target_ratio * num_pages
         self.pid = PIDController(
             kp=kp, ki=ki, kd=kd,
-            setpoint=target_active,
+            setpoint=target_pages,
             output_min=0.0,
             output_max=float(max_batch_size),
         )
 
-        # Request management
+        # Admission mode
+        self.admit_mode = admit_mode
+
+        # Request management (keyed by seq_id = req.id)
         self.waiting_queue: deque = deque()
-        self.active_pool: dict[int, Request] = {}  # slot_id -> Request
+        self.active_pool: dict[int, Request] = {}  # req.id -> Request
         self._next_id = 0
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
     # ═══════════════════════════════════════════════════════════════════════
 
-    def add_request(self, prompt_ids: torch.Tensor) -> int:
+    def add_request(self, prompt_ids: torch.Tensor, max_gen_tokens: int = -1) -> int:
         """Submit a new request. Returns request ID."""
-        req = Request(id=self._next_id, prompt_ids=prompt_ids.to(self.device))
+        req = Request(id=self._next_id, prompt_ids=prompt_ids.to(self.device),
+                      max_gen_tokens=max_gen_tokens)
         self._next_id += 1
         self.waiting_queue.append(req)
         return req.id
@@ -121,36 +129,36 @@ class PIDScheduler:
             return []
 
         # Phase 2: Separate decode vs prefill
-        decode_slots = []   # slots with is_prefilled=True (need 1 decode token)
-        prefill_slots = []  # slots with is_prefilled=False (need full prompt)
-        for slot_id, req in sorted(self.active_pool.items()):
+        decode_ids = []   # seq_ids with is_prefilled=True
+        prefill_ids = []  # seq_ids with is_prefilled=False
+        for seq_id, req in sorted(self.active_pool.items()):
             if req.is_prefilled:
-                decode_slots.append(slot_id)
+                decode_ids.append(seq_id)
             else:
-                prefill_slots.append(slot_id)
+                prefill_ids.append(seq_id)
 
-        # Phase 3: Assemble token-flat batch [decode | prefill]
-        # Batch layout: decode seqs first, prefill seqs after
-        all_slots = decode_slots + prefill_slots  # physical ordering
-        num_decode_seqs = len(decode_slots)
+        # Batch ordering: [decode_seqs | prefill_seqs]
+        all_seq_ids = decode_ids + prefill_ids
+        num_decode_seqs = len(decode_ids)
 
+        # Phase 3: Assemble token-flat batch
         tokens_list = []
         positions_list = []
         seq_lens_list = []
 
-        for slot_id in decode_slots:
-            req = self.active_pool[slot_id]
-            # Latest token to decode
+        for seq_id in decode_ids:
+            req = self.active_pool[seq_id]
             last_token = req.generated_ids[-1] if req.generated_ids else req.prompt_ids[-1:]
             if isinstance(last_token, torch.Tensor) and last_token.dim() == 0:
                 last_token = last_token.unsqueeze(0)
             tokens_list.append(last_token)
-            pos = torch.tensor([self.kv_cache.used_slots[slot_id]], dtype=torch.long, device=self.device)
+            ctx_len = self.kv_cache.seq_lens[seq_id]
+            pos = torch.tensor([ctx_len], dtype=torch.long, device=self.device)
             positions_list.append(pos)
             seq_lens_list.append(1)
 
-        for slot_id in prefill_slots:
-            req = self.active_pool[slot_id]
+        for seq_id in prefill_ids:
+            req = self.active_pool[seq_id]
             tokens_list.append(req.prompt_ids)
             plen = req.prompt_ids.size(0)
             positions_list.append(torch.arange(plen, device=self.device))
@@ -164,38 +172,45 @@ class PIDScheduler:
         seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=self.device)
 
         # Phase 4: Build metadata + forward
-        # prepare_batch builds contiguous cache tensor from active slots
-        self.kv_cache.prepare_batch(all_slots)
+        self.kv_cache.prepare_batch(all_seq_ids)
 
-        metadata = self._build_metadata(positions, seq_lens, num_decode_seqs, all_slots)
+        metadata = self._build_metadata(positions, seq_lens, num_decode_seqs, all_seq_ids)
         logits = self.model.forward(input_ids, positions, self.kv_cache, metadata)
 
-        # Writeback not needed — kernel writes directly to pool
-
-        # Advance context_lens for active slots
-        self.kv_cache.advance(seq_lens)
+        # Advance seq_lens in KV cache (allocates new pages if needed)
+        advance_ids = all_seq_ids
+        advance_counts = [int(seq_lens[i].item()) for i in range(len(all_seq_ids))]
+        try:
+            self.kv_cache.advance(advance_ids, advance_counts)
+        except PageOOMError:
+            # Preempt longest active sequences until advance succeeds
+            self._preempt_until_advance_ok(advance_ids, advance_counts)
 
         # Phase 5: Sample + EOS check
         completed = []
-        # Extract per-seq logits (last token of each seq)
         cu = seq_lens.cumsum(0).long()
-        last_positions = cu - 1  # index of last token per seq
+        last_positions = cu - 1
 
-        for i, slot_id in enumerate(all_slots):
-            req = self.active_pool[slot_id]
+        for i, seq_id in enumerate(all_seq_ids):
+            if seq_id not in self.active_pool:
+                continue  # preempted during OOM recovery
+            req = self.active_pool[seq_id]
             token_logits = logits[last_positions[i]]
 
-            # Sample
             next_token = self._sample(token_logits)
             req.generated_ids.append(next_token)
             req.is_prefilled = True
 
-            # Check EOS or max length
-            ctx_len = self.kv_cache.used_slots.get(slot_id, 0)
-            if next_token.item() == self.eos_token_id or ctx_len >= self.model.max_seq_len:
+            # Check EOS or max length or per-request generation cap
+            ctx_len = self.kv_cache.seq_lens[seq_id]
+            gen_len = len(req.generated_ids)
+            gen_limit = req.max_gen_tokens if req.max_gen_tokens > 0 else self.model.max_seq_len
+            if (next_token.item() == self.eos_token_id
+                    or ctx_len >= self.model.max_seq_len
+                    or gen_len >= gen_limit):
                 req.is_done = True
                 completed.append(req)
-                self._evict(slot_id)
+                self._evict(seq_id)
 
         return completed
 
@@ -213,52 +228,65 @@ class PIDScheduler:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _pid_admit(self):
-        """PID controls active_seqs count (not KV tokens directly).
+        """Admission control with three modes.
 
-        PV = current active sequence count (instant feedback)
-        SP = target_active = target_kv / (max_seq_len / 2)
-        CV = num_to_admit this step
-
-        This eliminates dead-time: admit +1 -> PV immediately +1.
-        KV naturally follows: KV ≈ active × avg_context_len.
+        Admission allocates initial pages for each new request's prompt.
         """
         if not self.waiting_queue:
             return
 
-        # PV = current active count (instant feedback, no delay)
-        pv = float(len(self.active_pool))
+        import math
+        page_size = self.kv_cache.page_size
 
-        # PID computes how many requests to admit
+        def _can_admit(req):
+            """Check if pool has enough free pages for this request's prompt."""
+            pages_needed = math.ceil(req.prompt_ids.size(0) / page_size)
+            return self.kv_cache.num_free >= pages_needed
+
+        def _do_admit(req):
+            """Admit a request: allocate pages and add to active pool."""
+            seq_id = req.id
+            pages_needed = math.ceil(req.prompt_ids.size(0) / page_size)
+            self.kv_cache.allocate_pages(seq_id, pages_needed)
+            self.active_pool[seq_id] = req
+
+        if self.admit_mode == "nopid":
+            while self.waiting_queue and _can_admit(self.waiting_queue[0]):
+                req = self.waiting_queue.popleft()
+                _do_admit(req)
+            return
+
+        if self.admit_mode == "threshold":
+            target = int(self.pid.setpoint)
+            num_to_admit = max(0, target - len(self.active_pool))
+            admitted = 0
+            while admitted < num_to_admit and self.waiting_queue and _can_admit(self.waiting_queue[0]):
+                req = self.waiting_queue.popleft()
+                _do_admit(req)
+                admitted += 1
+            return
+
+        # PID mode — PV is pages_used, SP is target_pages
+        pv = float(self.kv_cache.num_pages - self.kv_cache.num_free)
         raw_output = self.pid.compute(pv)
         num_to_admit = max(0, int(raw_output))
 
-        # Admit up to num_to_admit requests
         admitted = 0
-        while admitted < num_to_admit and self.waiting_queue and self.kv_cache.num_free > 0:
+        while admitted < num_to_admit and self.waiting_queue and _can_admit(self.waiting_queue[0]):
             req = self.waiting_queue.popleft()
-            slot = self.kv_cache.allocate()  # pool returns next free slot
-            req.slot_id = slot
-            self.active_pool[slot] = req
+            _do_admit(req)
             admitted += 1
 
-    def _evict(self, slot_id: int):
-        """Remove completed sequence from active pool, free its GPU memory."""
-        del self.active_pool[slot_id]
-        self.kv_cache.release(slot_id)  # GPU memory freed immediately
+    def _evict(self, seq_id: int):
+        """Remove completed sequence from active pool, free its pages."""
+        del self.active_pool[seq_id]
+        self.kv_cache.release(seq_id)
 
-    def _build_metadata(self, positions, seq_lens, num_decode_seqs, slot_ids):
+    def _build_metadata(self, positions, seq_lens, num_decode_seqs, seq_ids):
         """Build AttentionMetadata for the current batch.
 
-        NOTE: The model reads kv_cache.cache[:num_seqs, layer, ...].
-        We must ensure batch seq i maps to kv_cache slot slot_ids[i].
-        Since Attention uses metadata.seq_ids to index into cache views,
-        and cache view is kv_cache.cache[:num_seqs], we need slot_ids
-        to be exactly [0, 1, ..., num_seqs-1] for correctness.
-
-        Current approach: slot_ids is sorted ascending, and we pass
-        kv_cache directly. The kernel indexes cache[seq_id] which must
-        match the physical slot. This works when active slots are
-        the first N contiguous slots.
+        Uses kv_cache.batch_seq_lens as context_lens (built by prepare_batch).
+        block_tables is passed via kv_cache directly to Attention.forward.
         """
         AttentionMetadata = _get_attention_metadata_class()
 
@@ -275,8 +303,8 @@ class PIDScheduler:
         cu_seqlens_q = torch.zeros(num_seqs + 1, dtype=torch.int32, device=device)
         cu_seqlens_q[1:] = seq_lens.to(torch.int32).cumsum(0)
 
-        # ctx_lens: read from batch view (built by prepare_batch)
-        context_lens = self.kv_cache.context_lens
+        # ctx_lens: existing KV length + new tokens this step
+        context_lens = self.kv_cache.batch_seq_lens
         ctx_lens = context_lens + seq_lens.to(torch.int32)
 
         # Scalars
@@ -321,3 +349,31 @@ class PIDScheduler:
         logits = logits / self.temperature
         probs = logits.softmax(dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    def _preempt_until_advance_ok(self, advance_ids, advance_counts):
+        """Evict longest active sequences until advance succeeds (OOM recovery)."""
+        import math
+        max_retries = 50
+        for _ in range(max_retries):
+            # Find longest active seq to preempt
+            longest_id = max(
+                self.active_pool.keys(),
+                key=lambda sid: self.kv_cache.seq_lens.get(sid, 0)
+            )
+            # Evict: release pages, remove from active pool
+            self.kv_cache.release(longest_id)
+            evicted = self.active_pool.pop(longest_id)
+            # Remove from advance list (it's already evicted)
+            if longest_id in advance_ids:
+                idx = advance_ids.index(longest_id)
+                advance_ids.pop(idx)
+                advance_counts.pop(idx)
+            self._preempted_count = getattr(self, '_preempted_count', 0) + 1
+            # Retry advance with remaining seqs
+            try:
+                self.kv_cache.advance(advance_ids, advance_counts)
+                return
+            except PageOOMError:
+                continue
+        # If still failing after retries, just skip advance
+        pass
