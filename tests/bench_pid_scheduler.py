@@ -30,17 +30,17 @@ from components import PIDScheduler
 def get_arrival_rate(step: int) -> float:
     """Poisson base + burst spikes every 150 steps."""
     if step < 100:
-        base = 5.0   # warm-up
+        base = 8.0    # warm-up
     else:
-        base = 12.0  # sustained high load
-    # Burst: 10x for 5 steps, every 150 steps during high-load
+        base = 25.0   # sustained high load (supply > demand for PID control)
+    # Burst: 5x for 5 steps, every 150 steps during high-load
     if step >= 100 and (step % 150) < 5:
-        return base * 10.0
+        return base * 5.0
     return base
 
 
 def generate_workload(num_steps: int, seed: int = 42):
-    """Pre-generate: list of [(prompt_len, gen_len), ...] per step."""
+    """Pre-generate: list of [prompt_len, ...] per step. No gen_len — engine decides."""
     rng = np.random.RandomState(seed)
     workload = []
     for step in range(num_steps):
@@ -49,8 +49,7 @@ def generate_workload(num_steps: int, seed: int = 42):
         requests = []
         for _ in range(num_arrivals):
             plen = int(np.clip(rng.lognormal(4.0, 0.6), 16, 300))
-            glen = int(np.clip(rng.lognormal(3.9, 1.0), 5, 450))
-            requests.append((plen, glen))
+            requests.append(plen)
         workload.append(requests)
     return workload
 
@@ -75,7 +74,7 @@ def run_single(workload, admit_mode="pid", num_steps=1000, label=""):
         model,
         max_batch_size=MAX_BATCH,
         target_ratio=0.8,
-        kp=0.15, ki=0.005, kd=0.1,
+        kp=0.4, ki=0.02, kd=0.15,
         temperature=0.0,
         admit_mode=admit_mode,
         num_pages=NUM_PAGES,
@@ -92,9 +91,9 @@ def run_single(workload, admit_mode="pid", num_steps=1000, label=""):
 
     print(f"  Running {num_steps} steps...")
     for step in range(num_steps):
-        for (prompt_len, gen_len) in workload[step]:
+        for prompt_len in workload[step]:
             prompt = torch.randint(0, 1000, [prompt_len], device='cuda')
-            scheduler.add_request(prompt, max_gen_tokens=gen_len)
+            scheduler.add_request(prompt)  # no max_gen_tokens — engine decides
             total_submitted += 1
 
         completed = scheduler.step()
@@ -112,7 +111,9 @@ def run_single(workload, admit_mode="pid", num_steps=1000, label=""):
                   f"pages={NUM_PAGES - scheduler.kv_cache.num_free}/{NUM_PAGES}, "
                   f"queue={len(scheduler.waiting_queue)}")
 
-    print(f"  Done: submitted={total_submitted}, completed={total_completed}")
+    preempted = getattr(scheduler, '_preempted_count', 0)
+    print(f"  Done: submitted={total_submitted}, completed={total_completed}, "
+          f"preempted={preempted}")
 
     # Cleanup GPU memory for next run
     del scheduler, model
@@ -120,7 +121,9 @@ def run_single(workload, admit_mode="pid", num_steps=1000, label=""):
 
     return dict(steps=steps, kv_usage=kv_usage, active_counts=active_counts,
                 queue_lens=queue_lens, pages_used=pages_used,
-                target_pages=target_pages, num_pages=NUM_PAGES)
+                target_pages=target_pages, num_pages=NUM_PAGES,
+                submitted=total_submitted, completed=total_completed,
+                preempted=preempted)
 
 
 def run_benchmark(num_steps=1000):
@@ -128,9 +131,10 @@ def run_benchmark(num_steps=1000):
     print("Generating workload...")
     workload = generate_workload(num_steps)
     total_reqs = sum(len(w) for w in workload)
-    gen_lens = [g for step in workload for (_, g) in step]
-    print(f"  Requests: {total_reqs}, gen_len median={np.median(gen_lens):.0f}, "
-          f"mean={np.mean(gen_lens):.0f}, p99={np.percentile(gen_lens, 99):.0f}")
+    prompt_lens = [p for step in workload for p in step]
+    print(f"  Requests: {total_reqs}, prompt_len median={np.median(prompt_lens):.0f}, "
+          f"mean={np.mean(prompt_lens):.0f}")
+    print(f"  Engine autonomous stop: LogNormal(mu=4.5, sigma=1.2), median~90 tokens")
 
     pid_results = run_single(workload, admit_mode="pid", num_steps=num_steps,
                              label="(controlled)")
@@ -199,6 +203,11 @@ def plot_results(pid, nopid):
     pa2 = np.mean(pid['active_counts'])
     na2 = np.mean(nopid['active_counts'])
     print(f"  {'Mean active seqs':<25} {pa2:>12.1f} {na2:>12.1f} {na2-pa2:>+10.1f}")
+    print(f"  {'Completed':<25} {pid['completed']:>12} {nopid['completed']:>12}")
+    print(f"  {'Preempted (failed)':<25} {pid['preempted']:>12} {nopid['preempted']:>12}")
+    p_fail = pid['preempted'] / max(pid['submitted'], 1) * 100
+    n_fail = nopid['preempted'] / max(nopid['submitted'], 1) * 100
+    print(f"  {'Failure rate':<25} {p_fail:>11.2f}% {n_fail:>11.2f}%")
     print("="*60)
 
 

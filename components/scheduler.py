@@ -17,6 +17,8 @@ Every decode step:
 
 import torch
 import triton
+import math
+import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -62,6 +64,8 @@ class PIDScheduler:
         temperature: float = 0.0,
         admit_mode: str = "pid",  # "pid" | "threshold" | "nopid"
         num_pages: int = 4096,
+        stop_mu: float = 4.5,     # LogNormal mu for autonomous stop (IETF standard)
+        stop_sigma: float = 1.2,  # LogNormal sigma for autonomous stop
     ):
         self.model = model
         self.max_batch_size = max_batch_size
@@ -99,6 +103,11 @@ class PIDScheduler:
         self.waiting_queue: deque = deque()
         self.active_pool: dict[int, Request] = {}  # req.id -> Request
         self._next_id = 0
+
+        # Autonomous stop: LogNormal hazard rate for EOS injection
+        self.stop_mu = stop_mu
+        self.stop_sigma = stop_sigma
+        self._rng = np.random.RandomState(0)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Public API
@@ -205,6 +214,23 @@ class PIDScheduler:
             ctx_len = self.kv_cache.seq_lens[seq_id]
             gen_len = len(req.generated_ids)
             gen_limit = req.max_gen_tokens if req.max_gen_tokens > 0 else self.model.max_seq_len
+
+            # Autonomous stop: inject EOS via LogNormal hazard rate
+            # h(t) = f(t) / (1 - F(t)) where f,F are LogNormal PDF/CDF
+            if gen_len >= 1 and req.max_gen_tokens <= 0:
+                t = float(gen_len)
+                # LogNormal CDF: F(t) = 0.5 * (1 + erf((ln(t) - mu) / (sigma * sqrt(2))))
+                z = (math.log(t) - self.stop_mu) / self.stop_sigma
+                cdf_t = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+                # Hazard: h(t) = f(t) / (1 - F(t)), clamp survival > epsilon
+                survival = max(1.0 - cdf_t, 1e-6)
+                pdf_t = (1.0 / (t * self.stop_sigma * math.sqrt(2 * math.pi))) * \
+                        math.exp(-0.5 * z * z)
+                hazard = pdf_t / survival
+                # Clamp hazard to [0, 1] and roll dice
+                if self._rng.random() < min(hazard, 1.0):
+                    next_token = torch.tensor(self.eos_token_id, device=next_token.device)
+
             if (next_token.item() == self.eos_token_id
                     or ctx_len >= self.model.max_seq_len
                     or gen_len >= gen_limit):
